@@ -47,6 +47,7 @@ const DEFAULT_SETTINGS = {
   useMindmapGeminiKey: true,
   geminiModel: 'gemini-2.5-flash',
   defaultMode: 'rules', // 'rules' | 'ai_proof' | 'ai_struct'
+  docProfile: 'sermon', // 'sermon' (내 설교문 양식) | 'general' (일반 문서/원고)
   headingLevelScope: 'h1_h6', // 'h1_h6' | 'h1_h3' | 'h1_h2'
   autoNumberedStyle: 'smart', // 'smart' | 'to_bullet' | 'keep'
   mergeBrokenLines: true,
@@ -54,7 +55,7 @@ const DEFAULT_SETTINGS = {
   spacesToTabs: true,
   normalizeBibleRefs: true,
   quoteStandaloneVerses: false,
-  stripVerseBlockquotes: false,
+  stripVerseBlockquotes: true,
   addMissingFrontmatter: false,
   keepBackupOnOverwrite: false,
   customPromptNote: ''
@@ -100,6 +101,30 @@ function splitFrontmatter(text) {
   return { frontmatter: m[1], body: norm.slice(m[1].length) };
 }
 
+function applyDocProfileFrontmatter(head, isGeneralDoc, skipModify = false) {
+  const clean = String(head || '');
+  if (skipModify) return clean;
+  if (isGeneralDoc) {
+    if (clean) {
+      const m = clean.match(/^---\n([\s\S]*?)\n---(\n?)$/);
+      if (m) {
+        const innerLines = m[1].split('\n').filter((l) => !/^\s*vmark\s*:/i.test(l));
+        innerLines.push('vmark: false');
+        return `---\n${innerLines.join('\n')}\n---\n`;
+      }
+    }
+    return '---\nvmark: false\n---\n';
+  }
+  if (!clean) return '';
+  const m = clean.match(/^---\n([\s\S]*?)\n---(\n?)$/);
+  if (m) {
+    const kept = m[1].split('\n').filter((l) => !/^\s*vmark\s*:\s*false\s*$/i.test(l) && l.trim() !== '');
+    if (kept.length === 0) return '';
+    return `---\n${kept.join('\n')}\n---\n`;
+  }
+  return clean;
+}
+
 function isProtectedLine(line) {
   const t = line.trim();
   if (!t) return false;
@@ -115,12 +140,17 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
   const leading = line.match(/^[ \t]*/)[0];
   let rest = line.slice(leading.length);
 
-  // Optionally strip blockquote '>' before standalone Bible verse line
-  if (stripVerseQuotes && rest.startsWith('>')) {
-    const afterGt = rest.replace(/^>\s*/, '');
-    const startsWithRef = new RegExp(`^[(\\[]?\\s*(?:${BOOK_PATTERN})\\s*\\(?\\s*\\d{1,3}\\s*[:：]`).test(afterGt);
-    if (startsWithRef) {
-      rest = afterGt;
+  // Optionally strip blockquote '>' before standalone Bible verse line (including '- > (창 1:1)' or '\t- > ...')
+  if (stripVerseQuotes) {
+    const bulletGt = rest.match(/^([-*+]\s+)?(>\s*)(.*)$/);
+    if (bulletGt) {
+      const afterGt = (bulletGt[3] || '').trim();
+      const startsWithRef = new RegExp(`^[(\\[]?\\s*(?:${BOOK_PATTERN})\\s*\\(?\\s*\\d{1,3}\\s*[:：]`).test(afterGt);
+      if (startsWithRef) {
+        rest = `${bulletGt[1] || ''}${afterGt}`;
+      } else if (!afterGt) {
+        return '';
+      }
     }
   }
 
@@ -163,6 +193,34 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
   return leading + rest;
 }
 
+const QUOTED_VERSE_LINE_RE = new RegExp(
+  `^([ \\t]*(?:[-*+]\\s*)?)>\\s*([(\\[]?\\s*(${BOOK_PATTERN})\\s*\\(?\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[)\\]]?.*)$`
+);
+
+function extractQuotedVerseKeys(text) {
+  const keys = new Set();
+  for (const ln of String(text || '').split(/\r?\n/)) {
+    const m = ln.match(QUOTED_VERSE_LINE_RE);
+    if (m) {
+      const short = BOOK_FULL_TO_SHORT.get(m[3]) || m[3];
+      keys.add(`${short}:${m[4]}:${m[5].replace(/\s+/g, '').replace(/[～~]/g, '-')}`);
+    }
+  }
+  return keys;
+}
+
+function stripAiAddedVerseBlockquotes(text, origQuotedKeys) {
+  const allowed = origQuotedKeys || new Set();
+  return String(text || '').split('\n').map((ln) => {
+    const m = ln.match(QUOTED_VERSE_LINE_RE);
+    if (!m) return ln;
+    const short = BOOK_FULL_TO_SHORT.get(m[3]) || m[3];
+    const key = `${short}:${m[4]}:${m[5].replace(/\s+/g, '').replace(/[～~]/g, '-')}`;
+    if (allowed.has(key)) return ln;
+    return `${m[1]}${m[2]}`;
+  }).join('\n');
+}
+
 function getIndentWidth(leading) {
   let w = 0;
   for (const ch of leading) {
@@ -180,6 +238,14 @@ function isShortSubheadingBody(body, allowPeriod = false) {
   if (!allowPeriod && /\.$/.test(b)) return false;
   // Two or more comma-separated clauses usually means prose list item, not a heading
   if ((b.match(/,/g) || []).length >= 2) return false;
+  return true;
+}
+
+function isCircledHeadingBody(body) {
+  const b = String(body || '').trim();
+  if (!b || b.length > 180) return false;
+  if (/%%|\*\*\*/.test(b)) return false;
+  if (/^\([가-힣]+\s*\d+:\d+/.test(b)) return false;
   return true;
 }
 
@@ -365,7 +431,7 @@ function classifyOutlineLine(line) {
         kind: 'outline_sub',
         rank: 2,
         headingRank: 4.5,
-        canBeHeading: isShortSubheadingBody(wrappedCircled[2], false),
+        canBeHeading: isCircledHeadingBody(wrappedCircled[2]),
         indent,
         leading,
         marker: wrappedCircled[1],
@@ -444,7 +510,7 @@ function classifyOutlineLine(line) {
       kind: 'outline_sub',
       rank: 2,
       headingRank: 4.5,
-      canBeHeading: isShortSubheadingBody(circled[2], false),
+      canBeHeading: isCircledHeadingBody(circled[2]),
       indent,
       marker: circled[1],
       body: circled[2],
@@ -546,17 +612,20 @@ function hasUnclosedInlineBracket(str) {
 }
 
 function hasActiveVerseRangeTail(prevTrimmed, nextTrimmed) {
-  const cleanP = prevTrimmed.replace(/^>\s*/, '');
+  const nTrim = String(nextTrimmed || '').trim();
+  if (!nTrim || /^\s*(?:[-*+]\s*)?>/.test(nTrim) || isListLine(nextTrimmed)) return false;
+  if (BIBLE_REF_HEADER_RE.test(nTrim.replace(/^[-*+>\s]+/, ''))) return false;
+  const cleanP = prevTrimmed.replace(/^(?:[-*+]\s*)?>\s*/, '');
   const rangeM = cleanP.match(new RegExp(`^\\(?(?:${BOOK_PATTERN})\\s*\\d{1,3}:\\d{1,3}\\s*[-~]\\s*(\\d{1,3})\\)?`));
   if (!rangeM) return false;
   const endVerse = parseInt(rangeM[1], 10);
-  // Check whether endVerse has already appeared in prevTrimmed; if not (or mid-sentence at end), quote is still open!
-  const endVerseRe = new RegExp(`\\(${endVerse}\\)|\\b${endVerse}(?=[가-힣])`);
+  // Check whether endVerse has already appeared in prevTrimmed (supporting [17], (17), or 17한글/17 )
+  const endVerseRe = new RegExp(`\\[${endVerse}\\]|\\(${endVerse}\\)|\\b${endVerse}(?=[가-힣]|\\s)`);
   if (!endVerseRe.test(cleanP)) return true;
-  // Even if endVerse tag already appeared on prev, it might be the start of that verse ("(19) 무릇 이를 탐하는 자의 길은")
-  const afterEndV = cleanP.split(endVerseRe).pop() || '';
+  const parts = cleanP.split(endVerseRe);
+  const afterEndV = parts[parts.length - 1] || '';
   const afterClean = afterEndV.trim().replace(/(?:\]\{\.underline\}|\]|\})+$/g, '').trim();
-  return !/[.?!。？！"”’]$|(?:니라|리라|도다|노라|다|요|라)$/.test(afterClean);
+  return !/[.?!。？！"”’]$|(?:니라|리라|도다|노라|지어다|나이다|소서|아멘|다|요|라)$/.test(afterClean);
 }
 
 const _bibleVerseCache = new Map();
@@ -742,10 +811,14 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
   if (/^(?:강사|장소|날짜|일시|본문|제목|주제|시간|비고|참고)\s*[:：]/.test(n)) return false;
   if (/%%$/.test(p)) return false;
 
-  const isQuotePrev = p.startsWith('>');
+  const isQuotePrev = p.startsWith('>') || BIBLE_REF_HEADER_RE.test(p.replace(/^[-*+>\s]+/, ''));
   const activeVerseQuote = isQuotePrev && hasActiveVerseRangeTail(p, n);
   const unclosedSpan = hasUnclosedInlineBracket(p) || hasUnclosedBoldSpan(p, n) || /^\](?:\{\.underline\})?/.test(n);
   const nextIsInlineUnderline = /^\[[^\]]*\]\{\.underline\}/.test(n) || /^\[[^\]]+$/.test(n);
+
+  // Never merge another '>' blockquote or empty '- >' or new Bible passage header onto the end of prev
+  if (/^(?:[-*+]\s*)?>/.test(n)) return false;
+  if (BIBLE_REF_HEADER_RE.test(n.replace(/^[-*+>\s]+/, ''))) return false;
 
   // Inside an active ">..." range verse quote (or unclosed bracket), allow continuing even if next starts with (12) or - (10)
   if (!activeVerseQuote && !unclosedSpan) {
@@ -754,8 +827,9 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
     if (nextIsInlineUnderline && /^\[\s*(?:마|막|눅|요|행|롬|고전|고후|갈|엡|빌|골|살전|살후|딤전|딤후|딛|몬|히|약|벧전|벧후|요일|이|삼|유|계|창|출|레|민|신)\s*\d+/.test(n)) return false;
     if (new RegExp(`^(?:${BOOK_PATTERN})\\s*\\(?\\d{1,3}\\s*[:：]`).test(n)) return false;
   } else {
+    if (isListLine(nextLine) && !/^[-*+]\s+(?:\(\d{1,3}\)|\[\d{1,3}\])/.test(n)) return false;
     // Even inside active verse quote, never merge into headings/symbols/new Bible ref lines/outline items
-    if (/^(?:✓|✔|※|예\)|▶|●|■|◆|▲|★|◎|◩|[①-⑳]|\d+[.)]|[가-하]\.|[a-zA-Z]\.)/.test(n)) return false;
+    if (/^(?:✓|✔|※|예\)|▶|●|■|◆|▲|★|◎|◩|•|◦|▪|[①-⑳]|\d+[.)]|[가-하]\.|[a-zA-Z]\.)/.test(n)) return false;
     if (new RegExp(`^\\(?(?:${BOOK_PATTERN})\\s*\\d{1,3}\\s*[:：]`).test(n)) return false;
   }
 
@@ -768,7 +842,7 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
   if (activeVerseQuote) return true;
 
   if (gapCount === 0) {
-    if (isQuotePrev && /(?:니라|리라|도다|노라|지어다|나이다|소서|다)$/.test(pCore)) return false;
+    if (isQuotePrev && /(?:니라|리라|도다|노라|지어다|나이다|소서|아멘|다|요|라)[.?!]?$/.test(pCore)) return false;
     if (/[.?!。？！"'”’\])…]$/.test(pCore)) return false;
     return pCore.length >= 26 || isDocxHardWrapTail(pCore, n);
   }
@@ -945,6 +1019,75 @@ function isConciseStatementHeading(body) {
   return /(?:다\.)$/.test(stripped);
 }
 
+// Detect contiguous inline numbered prose lists like:
+//   "그러나 미련한 자는 눈을 땅 끝에 둔다."
+//   "1) 구원이 ... 사람이다."
+//   "2) 성경에서 ... 사람인 것이다."
+//   "3) 무슨 특별한 ... 사람이다."
+// where items sit directly under a prose sentence with zero child lines inside the list and every item is a long declarative sentence.
+function _outlineFamilyOfParsed(p) {
+  if (!p) return '';
+  if (p.tag && p.tag.family) return p.tag.family;
+  if (p.kind === 'heading_num_candidate' || p.kind === 'ordered_list') return 'num_dot';
+  if (p.kind === 'outline_sub') {
+    if (/^\d{1,2}\)$/.test(p.marker || '')) return 'half_paren';
+    if (/^\(\d{1,2}\)$/.test(p.marker || '')) return 'full_paren';
+  }
+  return '';
+}
+
+function isContiguousProseListAt(parsed, idx, fenced) {
+  const cur = parsed[idx];
+  const fam = _outlineFamilyOfParsed(cur);
+  if (fam !== 'num_dot' && fam !== 'half_paren' && fam !== 'full_paren') return false;
+
+  const isSameCol0 = (p) => {
+    if (!p || p.kind === 'heading') return false;
+    if (_outlineFamilyOfParsed(p) !== fam) return false;
+    if (p.kind === 'bullet') return (p.tabDepth || 0) === 0;
+    if (typeof p.indent === 'number') return p.indent === 0;
+    return true;
+  };
+
+  let start = idx;
+  while (start - 1 >= 0 && !(fenced && fenced[start - 1]) && isSameCol0(parsed[start - 1])) {
+    start--;
+  }
+  let end = idx;
+  while (end + 1 < parsed.length && !(fenced && fenced[end + 1]) && isSameCol0(parsed[end + 1])) {
+    end++;
+  }
+  const runLen = end - start + 1;
+  if (runLen < 2) return false;
+
+  const stripMark = (p) =>
+    String((p.tag && p.tag.text) || p.body || '')
+      .trim()
+      .replace(/^(?:\d{1,2}[.)]|\(\d{1,2}\))\s*/, '')
+      .trim();
+  const bodies = [];
+  for (let k = start; k <= end; k++) {
+    bodies.push(stripMark(parsed[k]));
+  }
+  const allSentenceEnd = bodies.every((b) => /(?:다|요|죠|까|네|라)\.$/.test(b));
+  const avgLen = bodies.reduce((s, b) => s + b.length, 0) / bodies.length;
+  const minLen = Math.min(...bodies.map((b) => b.length));
+  if (!allSentenceEnd || (minLen < 35 && avgLen < 42)) return false;
+
+  // Check if preceded immediately (skipping blanks) by non-heading prose
+  let prevIdx = start - 1;
+  while (
+    prevIdx >= 0 &&
+    (parsed[prevIdx].kind === 'blank' || (parsed[prevIdx].kind === 'other' && !parsed[prevIdx].trimmed))
+  ) {
+    prevIdx--;
+  }
+  const prev = prevIdx >= 0 ? parsed[prevIdx] : null;
+  const prevTxt = (prev && (prev.trimmed || prev.text || '')) || '';
+  const precededByProse = !!prev && prev.kind !== 'heading' && !/^>/.test(prevTxt);
+  return precededByProse || avgLen >= 42;
+}
+
 function formatReconcileListLine(indentUnit, depth, body, orderedMarker) {
   const cleanBody = normalizeTightOutlineSpacing(body);
   if (orderedMarker || /^\d{1,2}[.)]\s+/.test(cleanBody)) {
@@ -1041,6 +1184,7 @@ function reconcileDocumentStructure(lines, opts) {
   const maxHeadingLevel = scope === 'h1_h2' ? 2 : (scope === 'h1_h3' ? 3 : 6);
   const indentUnit = opts.spacesToTabs === false ? '  ' : '\t';
   const autoNumStyle = opts.autoNumberedStyle || 'smart';
+  const isGeneralDoc = opts.docProfile === 'general';
 
   let fence = false;
   const fenced = out.map((l) => {
@@ -1060,30 +1204,45 @@ function reconcileDocumentStructure(lines, opts) {
     let rest = normalizeTightOutlineSpacing(raw.slice(leadWs.length).trim());
     if (!rest) { out[i] = ''; continue; }
 
-    // Unwrap "- 1) ..." / "ㆍ1) ..." -> "1) ..."
-    const wrapHalf = rest.match(/^(?:-\s+|[ㆍ·•]\s*)(\d{1,2}\))\s*(.+)$/);
+    // Unwrap "- 1) ..." / "- **1) ...**" / "ㆍ1) ..." -> "1) ..." / "1) **...**"
+    const wrapHalf = rest.match(/^(?:-\s+|[ㆍ·•]\s*)(?:\*\*(\d{1,2}\))\*\*\s*(.+)|(\*\*)?(\d{1,2}\))\s*(.+))$/);
     if (wrapHalf) {
-      out[i] = `${tabsOnly}${wrapHalf[1]} ${wrapHalf[2]}`;
+      if (wrapHalf[1]) {
+        out[i] = `${tabsOnly}${wrapHalf[1]} ${wrapHalf[2]}`;
+      } else {
+        const bodyHalf = wrapHalf[3] ? `**${wrapHalf[5]}` : wrapHalf[5];
+        out[i] = `${tabsOnly}${wrapHalf[4]} ${bodyHalf}`;
+      }
       continue;
     }
-    // Handle "- 1. ..." / "ㆍ1. ..." / "- 2. ..."
-    const wrapDot = rest.match(/^(?:-\s+|[ㆍ·•]\s*)(\d{1,2})\.\s*(.+)$/);
+    // Handle "- 1. ..." / "- **1. ...**" / "ㆍ1. ..." / "- 2. ..."
+    const wrapDot = rest.match(/^(?:-\s+|[ㆍ·•]\s*)(?:\*\*(\d{1,2})\.\*\*\s*(.+)|(\*\*)?(\d{1,2})\.\s*(.+))$/);
     if (wrapDot) {
-      const nv = parseInt(wrapDot[1], 10);
+      const nv = parseInt(wrapDot[1] || wrapDot[4], 10);
+      const isBoldWrap = !!wrapDot[3];
+      const dotBody = wrapDot[1] ? wrapDot[2] : (isBoldWrap ? `**${wrapDot[5]}` : wrapDot[5]);
       if (nv >= 2 && autoNumStyle !== 'to_bullet') {
-        out[i] = `${tabsOnly}${wrapDot[1]}. ${wrapDot[2]}`;
+        out[i] = `${tabsOnly}${nv}. ${dotBody}`;
         continue;
       }
       if (nv === 1) {
         let hasSeq2 = false;
-        for (let k = i + 1; k < Math.min(out.length, i + 40); k++) {
-          if (/^#{1,3}\s+/.test(out[k].trim())) break;
-          if (/^[ \t]*(?:-\s+)?2\.\s*/.test(out[k])) { hasSeq2 = true; break; }
+        const curWidth = getIndentWidth(leadWs);
+        for (let k = i + 1; k < Math.min(out.length, i + 80); k++) {
+          const lk = out[k];
+          if (!lk.trim()) continue;
+          if (/^#{1,6}\s+/.test(lk.trim())) break;
+          const lkWidth = getIndentWidth(lk.match(/^[ \t]*/)[0]);
+          if (lkWidth < curWidth) break;
+          if (lkWidth === curWidth && /^(?:(?:-\s+|[ㆍ·•]\s*))?(?:\*\*)?2\.\s*/.test(lk.slice(lk.match(/^[ \t]*/)[0].length))) {
+            hasSeq2 = true;
+            break;
+          }
         }
-        if (hasSeq2 && autoNumStyle !== 'to_bullet') {
-          out[i] = `${tabsOnly}1. ${wrapDot[2]}`;
+        if ((hasSeq2 || isBoldWrap) && autoNumStyle !== 'to_bullet') {
+          out[i] = `${tabsOnly}1. ${dotBody}`;
         } else if (autoNumStyle !== 'keep') {
-          out[i] = `${tabsOnly}- ${wrapDot[2]}`;
+          out[i] = `${tabsOnly}- ${dotBody}`;
         }
         continue;
       }
@@ -1128,7 +1287,7 @@ function reconcileDocumentStructure(lines, opts) {
         bulletStack.length = 0;
         continue;
       }
-      if (bulletStack.length > 0 && p.tag && !isMajorSymbolFamily(p.tag.family)) {
+      if (bulletStack.length > 0 && p.tag && !isMajorSymbolFamily(p.tag.family) && p.tag.family !== 'circled') {
         let sameFamIdx = -1;
         for (let k = bulletStack.length - 1; k >= 0; k--) {
           if (bulletStack[k].family === p.tag.family) { sameFamIdx = k; break; }
@@ -1285,85 +1444,205 @@ function reconcileDocumentStructure(lines, opts) {
     secIdx = secEnd;
   }
 
-  // 2-outline-doc: Document-wide Outline Family Consistency across sibling sections
-  // If a .md file uses 1. / 1) / (1) / A. / a. / 가. as a heading tier, ALL col-0 siblings of that family unify to that heading level.
+  // 2-outline-doc: Parent-Scoped Outline Family Consistency
+  // Unify unpromoted siblings / mixed headings of the SAME outline family under the SAME parent level (never flattening ### 1) under ## 2. up to ## 1)).
   const DOC_ALIGN_FAMILIES = new Set(['num_dot', 'full_paren', 'half_paren', 'cap_alpha', 'lower_alpha', 'kor_dot']);
-  const docOutlineStats = new Map();
-  const docCol0SiblingCounts = new Map();
-  for (let i = 0; i < parsed.length; i++) {
-    const p = parsed[i];
-    if (!p.tag || !DOC_ALIGN_FAMILIES.has(p.tag.family)) continue;
-    const fam = p.tag.family;
-    if (p.kind === 'heading') {
-      if (!docOutlineStats.has(fam)) docOutlineStats.set(fam, []);
-      docOutlineStats.get(fam).push({
-        idx: i,
-        level: p.level,
-        ordinal: p.tag.ordinal,
-        body: p.body,
-        isProse: !isEligibleOutlineText(fam, p.body) && isSentenceOrColonProse(p.body)
-      });
-    } else if ((p.kind === 'bullet' && p.tabDepth === 0) || (p.kind === 'other' && !/^[ \t]/.test(out[i]))) {
-      docCol0SiblingCounts.set(fam, (docCol0SiblingCounts.get(fam) || 0) + 1);
+  const docAlignRanks = { cap_alpha: 1, num_dot: 2, half_paren: 3, full_paren: 4, circled: 4.5, kor_dot: 5, lower_alpha: 5.5 };
+  const getParentScopeInfo = (pLines, targetFamilies) => {
+    const pStack = []; // { idx, level, family, rank }
+    const scopes = new Array(pLines.length).fill(null);
+    for (let i = 0; i < pLines.length; i++) {
+      const p = pLines[i];
+      if (p.kind === 'heading') {
+        const fam = p.tag ? p.tag.family : 'major';
+        const rank = p.tag ? (docAlignRanks[fam] || p.level) : p.level;
+        while (pStack.length > 0 && pStack[pStack.length - 1].level >= p.level) pStack.pop();
+        const activeParent = pStack.length > 0 ? pStack[pStack.length - 1] : { idx: -1, level: 0, family: 'root', rank: 0 };
+        scopes[i] = activeParent;
+        pStack.push({ idx: i, level: p.level, family: fam, rank });
+      } else if (p.tag && targetFamilies.has(p.tag.family)) {
+        const famRank = docAlignRanks[p.tag.family] || p.tag.rank || 5;
+        let par = { idx: -1, level: 0, family: 'root', rank: 0 };
+        for (let k = pStack.length - 1; k >= 0; k--) {
+          if (pStack[k].family !== p.tag.family && pStack[k].rank < famRank) {
+            par = pStack[k];
+            break;
+          }
+        }
+        scopes[i] = par;
+      }
     }
-  }
+    return scopes;
+  };
+
   const docAlignedFamilies = new Set();
-  for (const [fam, hList] of docOutlineStats.entries()) {
+  for (const fam of DOC_ALIGN_FAMILIES) {
     const isNumericFam = NUMERIC_OUTLINE_FAMILIES.has(fam);
-    if (hList.length === 0) continue;
-    // Do not treat a lone mid-list stray heading (like "## 6." or "#### 라." inside a col-0 list) as a document heading tier
-    if (hList.length === 1 && hList[0].ordinal > 1 && (docCol0SiblingCounts.get(fam) || 0) >= 2) continue;
-    if (isNumericFam ? !hList.some((h) => !h.isProse) : hList.some((h) => h.isProse)) continue;
-    const targetLevel = Math.min(maxHeadingLevel, Math.min(...hList.map((h) => h.level)));
-    if (targetLevel < 2) continue;
-    docAlignedFamilies.add(fam);
-    let lastHigherLevel = 0;
+    const scopes = getParentScopeInfo(parsed, DOC_ALIGN_FAMILIES);
+    const tierStats = new Map(); // parentLevel -> { headings: [], unpromotedCount: 0, byParentIdx: Map<parentIdx, { headings, unpromoted }> }
+
     for (let i = 0; i < parsed.length; i++) {
       const p = parsed[i];
-      if (p.kind === 'heading') {
-        if (p.level < targetLevel) lastHigherLevel = p.level;
-        else if (p.tag && p.tag.family === fam && p.level !== targetLevel) {
-          out[i] = `${'#'.repeat(targetLevel)} ${p.body}`;
-        }
-        continue;
-      }
       if (!p.tag || p.tag.family !== fam) continue;
-      const fitsNumericHeading =
-        isNumericFam &&
-        p.tag.text.length <= 220 &&
-        !/%%|\*\*\*/.test(p.tag.text);
-      const fitsNonNumericHeading =
-        !isNumericFam &&
-        p.tag.text.length <= 65 &&
-        (!/[.?!다요죠]$/.test(p.tag.text) || isEligibleOutlineText(fam, p.tag.text)) &&
-        !(p.tag.text.length > 44 && /,/.test(p.tag.text));
-      if (
-        ((p.kind === 'bullet' && p.tabDepth === 0) || (p.kind === 'other' && !/^[ \t]/.test(out[i]))) &&
-        (fitsNumericHeading || fitsNonNumericHeading) &&
-        !/^>/.test(p.body) &&
-        (lastHigherLevel === 0 || lastHigherLevel < targetLevel)
-      ) {
-        out[i] = `${'#'.repeat(targetLevel)} ${p.tag.text}`;
+      const par = scopes[i] || { idx: -1, level: 0 };
+      if (!tierStats.has(par.level)) {
+        tierStats.set(par.level, { headings: [], unpromotedCount: 0, byParentIdx: new Map() });
+      }
+      const tier = tierStats.get(par.level);
+      if (!tier.byParentIdx.has(par.idx)) {
+        tier.byParentIdx.set(par.idx, { headings: [], unpromoted: [] });
+      }
+      const pBucket = tier.byParentIdx.get(par.idx);
+
+      if (p.kind === 'heading') {
+        const hEntry = {
+          idx: i,
+          parentIdx: par.idx,
+          parentLevel: par.level,
+          level: p.level,
+          ordinal: p.tag.ordinal,
+          body: p.body,
+          isProse: !isEligibleOutlineText(fam, p.body) && isSentenceOrColonProse(p.body)
+        };
+        tier.headings.push(hEntry);
+        pBucket.headings.push(hEntry);
+      } else if ((p.kind === 'bullet' && p.tabDepth === 0) || (p.kind === 'other' && !/^[ \t]/.test(out[i]))) {
+        tier.unpromotedCount++;
+        pBucket.unpromoted.push(i);
       }
     }
-    parsed = out.map((l, idx) => (fenced[idx] ? { kind: 'other' } : parseReconcileLine(l)));
+
+    const docHasProse = Array.from(tierStats.values()).some((t) => t.headings.some((h) => h.isProse));
+    if (!isNumericFam && fam !== 'cap_alpha' && docHasProse) continue;
+
+    let changedAny = false;
+    for (const [parLevel, tier] of tierStats.entries()) {
+      const hList = tier.headings;
+      if (hList.length === 0) continue;
+      if (hList.length === 1 && hList[0].ordinal > 1 && tier.unpromotedCount >= 2) continue;
+      if (isNumericFam ? !hList.some((h) => !h.isProse) : hList.some((h) => h.isProse)) continue;
+
+      const minValidLevel = fam === 'cap_alpha' ? 1 : Math.max(2, parLevel + 1);
+      const tierTargetLevel = Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...hList.map((h) => h.level))));
+
+      for (const [parIdx, pBucket] of tier.byParentIdx.entries()) {
+        const bh = pBucket.headings;
+        const candidateUnpromoted = pBucket.unpromoted.filter((uIdx) => {
+          const p = parsed[uIdx];
+          if (isNumericFam && isContiguousProseListAt(parsed, uIdx, fenced)) return false;
+          const fitsNumericHeading =
+            isNumericFam &&
+            p.tag.text.length <= 220 &&
+            !/%%|\*\*\*/.test(p.tag.text);
+          const fitsNonNumericHeading =
+            !isNumericFam &&
+            p.tag.text.length <= 65 &&
+            (!/[.?!다요죠]$/.test(p.tag.text) || isEligibleOutlineText(fam, p.tag.text) || (fam === 'cap_alpha' && p.tag.text.length <= 36 && !/[?!]/.test(p.tag.text))) &&
+            !(p.tag.text.length > 44 && /,/.test(p.tag.text));
+          return (fitsNumericHeading || fitsNonNumericHeading) && !/^>/.test(p.body);
+        });
+        // Preserve an already-uniform section if it has zero unpromoted heading-like siblings
+        const levelsHere = new Set(bh.map((h) => h.level));
+        if (bh.length > 0 && levelsHere.size === 1 && bh[0].level > parLevel && candidateUnpromoted.length === 0) {
+          continue;
+        }
+        const localTarget = bh.length > 0
+          ? Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...bh.map((h) => h.level))))
+          : tierTargetLevel;
+
+        for (const h of bh) {
+          if (h.level !== localTarget) {
+            out[h.idx] = `${'#'.repeat(localTarget)} ${h.body}`;
+            changedAny = true;
+          }
+        }
+        for (const uIdx of candidateUnpromoted) {
+          const p = parsed[uIdx];
+          out[uIdx] = `${'#'.repeat(localTarget)} ${p.tag.text}`;
+          changedAny = true;
+        }
+      }
+      docAlignedFamilies.add(fam);
+    }
+    if (changedAny) {
+      parsed = out.map((l, idx) => (fenced[idx] ? { kind: 'other' } : parseReconcileLine(l)));
+    }
   }
 
-  // 2a: Align H3~H6 circled headings (①, ②, ③) within the same H1/H2 section AND align mixed num_dot/half_paren siblings
+  // 2-circled-promote: Circled numbers (①..⑳) are deliberate headings; promote each under its nearest parent heading above
+  // Also preserve nested ①..⑧ restarts inside a preceding circled heading (e.g. #### ③ -> prose -> ##### ①..⑧).
+  const CIRCLES_PARENT_FAMILIES = new Set(['major', 'roman', 'num_dot', 'half_paren', 'full_paren', 'cap_alpha']);
+  const circledParentStack = [];
+  let activeCircledOuter = null; // { level, ordinal, hadProse }
+  for (let i = 0; i < parsed.length; i++) {
+    if (fenced[i]) continue;
+    const p = parsed[i];
+    if (p.kind === 'heading') {
+      const fam = p.tag ? p.tag.family : '';
+      if (!p.tag || isMajorSymbolFamily(fam) || CIRCLES_PARENT_FAMILIES.has(fam)) {
+        while (circledParentStack.length > 0 && circledParentStack[circledParentStack.length - 1] >= p.level) {
+          circledParentStack.pop();
+        }
+        circledParentStack.push(p.level);
+        if (activeCircledOuter && p.level <= activeCircledOuter.level) {
+          activeCircledOuter = null;
+        }
+      } else if (fam === 'circled') {
+        if (activeCircledOuter && p.level > activeCircledOuter.level) {
+          // keep nested
+        } else {
+          activeCircledOuter = { level: p.level, ordinal: p.tag.ordinal, hadProse: false };
+        }
+      }
+      continue;
+    }
+    if ((p.kind === 'bullet' || p.kind === 'other') && p.tag && p.tag.family === 'circled' && !/^>/.test(p.body || p.trimmed || '')) {
+      const innerBody = p.tag.text.replace(/^[①-⑳]\s*/, '');
+      if (!isCircledHeadingBody(innerBody)) continue;
+      let parentLvl = circledParentStack.length > 0 ? circledParentStack[circledParentStack.length - 1] : 1;
+      if (activeCircledOuter && activeCircledOuter.ordinal >= 2 && activeCircledOuter.hadProse && p.tag.ordinal === 1) {
+        parentLvl = Math.max(parentLvl, activeCircledOuter.level);
+      }
+      const targetLvl = Math.max(2, parentLvl + 1);
+      if (targetLvl <= maxHeadingLevel) {
+        out[i] = `${'#'.repeat(targetLvl)} ${p.tag.text}`;
+        if (!activeCircledOuter || targetLvl <= activeCircledOuter.level) {
+          activeCircledOuter = { level: targetLvl, ordinal: p.tag.ordinal, hadProse: false };
+        }
+      }
+      continue;
+    }
+    if (activeCircledOuter && p.trimmed) {
+      activeCircledOuter.hadProse = true;
+    }
+  }
+  parsed = out.map((l, idx) => (fenced[idx] ? { kind: 'other' } : parseReconcileLine(l)));
+
+  // 2a: Align H3~H6 circled headings (①, ②, ③) within the same parent scope AND align mixed num_dot/half_paren siblings
   const headingFamilyGroups = new Map();
   const sectionNumSeries = new Map();
   let curMajorIdx = -1;
   let curMajorLevel = 0;
+  let curCircledDepthKey = 0;
+  let prevCircledSeen = null;
   for (let i = 0; i < parsed.length; i++) {
     const p = parsed[i];
     if (p.kind === 'heading') {
-      if (p.level === 1 || (p.level <= 2 && (!p.tag || (isMajorSymbolFamily(p.tag.family) && p.tag.family !== 'sym_▶')))) {
+      if (p.level === 1 || (p.level <= 2 && (!p.tag || p.tag.family !== 'sym_▶'))) {
         curMajorIdx = i;
         curMajorLevel = p.level;
+        prevCircledSeen = null;
+        curCircledDepthKey = 0;
         continue;
       }
       if (p.level >= 3 && p.tag && p.tag.family === 'circled') {
-        const gKey = `${curMajorIdx}:${p.tag.family}`;
+        if (prevCircledSeen && p.level > prevCircledSeen.level && p.tag.ordinal === 1) {
+          curCircledDepthKey = prevCircledSeen.level;
+        } else if (curCircledDepthKey && p.level <= curCircledDepthKey) {
+          curCircledDepthKey = 0;
+        }
+        prevCircledSeen = { level: p.level, ordinal: p.tag.ordinal };
+        const gKey = `${curMajorIdx}:${curCircledDepthKey}:${p.tag.family}`;
         if (!headingFamilyGroups.has(gKey)) headingFamilyGroups.set(gKey, []);
         headingFamilyGroups.get(gKey).push({ idx: i, level: p.level, body: p.body });
       }
@@ -1378,6 +1657,8 @@ function reconcileDocumentStructure(lines, opts) {
       if (p.level <= 2 && !p.tag) {
         curMajorIdx = i;
         curMajorLevel = p.level;
+        prevCircledSeen = null;
+        curCircledDepthKey = 0;
       }
       continue;
     }
@@ -1500,7 +1781,7 @@ function reconcileDocumentStructure(lines, opts) {
 
   for (const [gKey, group] of familyGroups.entries()) {
     const fam = gKey.split(':')[1];
-    if (docAlignedFamilies.has(fam)) continue;
+    if (fam === 'circled' || docAlignedFamilies.has(fam)) continue;
     if (group.length < 2) continue;
     const headings = group.filter((g) => g.kind === 'heading');
     const bullets = group.filter((g) => g.kind === 'bullet');
@@ -1552,7 +1833,7 @@ function reconcileDocumentStructure(lines, opts) {
   let activeOrd = null; // { tabDepth, family, introBoost }
   let seenBlankSinceOrd = false;
   let lastNonBlankBeforeOrdIdx = -1;
-  for (let i = 0; i < out.length; i++) {
+  for (let i = 0; !isGeneralDoc && i < out.length; i++) {
     if (fenced[i]) { activeOrd = null; lastNonBlankBeforeOrdIdx = -1; continue; }
     const p = parsed[i];
     if (p.kind === 'other' && !p.trimmed) {
@@ -1640,6 +1921,10 @@ function reconcileDocumentStructure(lines, opts) {
   let sawHeadingForDef = false;
   let inDefSeries = false;
   for (let i = 0; i < out.length; i++) {
+    if (isGeneralDoc) {
+      nestDefOut.push(out[i]);
+      continue;
+    }
     if (fenced[i]) {
       inDefSeries = false;
       nestDefOut.push(out[i]);
@@ -1752,6 +2037,88 @@ function reconcileDocumentStructure(lines, opts) {
 
   // Pass 3c: Re-sync bullet nesting depths cleanly after any Pass 2/3a/3b updates
   out = syncBulletIndentPass(out, fenced, indentUnit);
+
+  // Pass 4: Dedent orphaned tab-indented bullet blocks sitting directly beneath a heading
+  // (e.g. "## 9. ...\n\t- item" -> "## 9. ...\n- item") so Obsidian renders clean '•' bullets without '✓ -'.
+  {
+    let afterHeadingNoCol0Body = false;
+    let activeDedentShift = 0;
+    let inFence4 = false;
+    for (let i = 0; i < out.length; i++) {
+      if (/^\s*(?:```|~~~)/.test(out[i])) {
+        inFence4 = !inFence4;
+        afterHeadingNoCol0Body = false;
+        activeDedentShift = 0;
+        continue;
+      }
+      if (inFence4) continue;
+      if (!out[i].trim()) continue;
+      const p = parseReconcileLine(out[i]);
+      if (p.kind === 'heading') {
+        afterHeadingNoCol0Body = true;
+        activeDedentShift = 0;
+        continue;
+      }
+      if (afterHeadingNoCol0Body) {
+        if (p.kind === 'bullet' && !p.orderedMarker) {
+          if (p.tabDepth > 0) {
+            activeDedentShift = p.tabDepth;
+            afterHeadingNoCol0Body = false;
+            out[i] = formatReconcileListLine(indentUnit, 0, p.body, null);
+            continue;
+          }
+          afterHeadingNoCol0Body = false;
+          activeDedentShift = 0;
+          continue;
+        }
+        afterHeadingNoCol0Body = false;
+        activeDedentShift = 0;
+        continue;
+      }
+      if (activeDedentShift > 0) {
+        if (p.kind === 'bullet' && p.tabDepth >= activeDedentShift) {
+          const newD = p.tabDepth - activeDedentShift;
+          if (newD === 0 && p.orderedMarker) {
+            activeDedentShift = 0;
+          } else {
+            out[i] = formatReconcileListLine(indentUnit, newD, p.body, p.orderedMarker);
+          }
+          continue;
+        }
+        activeDedentShift = 0;
+      }
+    }
+  }
+
+  // Pass 5 (general document profile): unwrap literal ✓/✔, level-0 '-' ('V' mark), & indented prose bullets cleanly
+  if (isGeneralDoc) {
+    let inFence5 = false;
+    for (let i = 0; i < out.length; i++) {
+      if (/^\s*(?:```|~~~)/.test(out[i])) { inFence5 = !inFence5; continue; }
+      if (inFence5) continue;
+      if (/^[ \t]*[✓✔]\s+/.test(out[i])) {
+        out[i] = out[i].replace(/^[ \t]*[✓✔]\s+/, '');
+      }
+      const mCol0 = out[i].match(/^-\s+(.+)$/);
+      if (mCol0) {
+        const body = mCol0[1].trim();
+        const prevShortDash = i > 0 && /^-\s+/.test(out[i - 1]) && out[i - 1].length <= 28 && !/[.?!。]$/.test(out[i - 1]);
+        const nextShortDash = i + 1 < out.length && /^-\s+/.test(out[i + 1]) && out[i + 1].length <= 28 && !/[.?!。]$/.test(out[i + 1]);
+        if (body.length >= 22 || /[.?!。]["'”’)]*$/.test(body) || !(prevShortDash || nextShortDash)) {
+          out[i] = body;
+        }
+        continue;
+      }
+      const mIndentedProse = out[i].match(/^\t+-\s+(.+)$/);
+      if (mIndentedProse) {
+        const body = mIndentedProse[1].trim();
+        if (body.length >= 20 || /[.?!。]["'”’)]*$/.test(body)) {
+          out[i] = body;
+        }
+      }
+    }
+  }
+
   return out;
 }
 
@@ -1787,6 +2154,10 @@ function refineMarkdownByRules(rawText, options = {}) {
     .replace(/[\u00A0\u200B\uFEFF]/g, (ch) => (ch === '\u00A0' ? ' ' : ''));
 
   let rawLines = text.split('\n').map((l) => l.replace(/[ \t]+$/g, ''));
+  // Normalize HTML/Pandoc wrappers, leading '-' on '>' verse lines when stripping quotes, etc.
+  if (opts.stripVerseBlockquotes) {
+    rawLines = rawLines.map((l) => normalizeBibleRefsInLine(l, false, true));
+  }
   if (opts.mergeBrokenLines) {
     rawLines = mergeBrokenLinesPass(rawLines, opts.vaultBasePath || '');
   }
@@ -1799,6 +2170,7 @@ function refineMarkdownByRules(rawText, options = {}) {
   const scope = opts.headingLevelScope || 'h1_h6';
   const maxHeadingLevel = scope === 'h1_h2' ? 2 : (scope === 'h1_h3' ? 3 : 6);
   const autoNumStyle = opts.autoNumberedStyle || 'smart';
+  const isGeneralDoc = opts.docProfile === 'general';
 
   // First pass: optional frontmatter extraction if missing
   let generatedFm = '';
@@ -1839,6 +2211,47 @@ function refineMarkdownByRules(rawText, options = {}) {
       pl.kind === 'heading_roman' ||
       (pl.kind === 'heading' && pl.level === 1)
   );
+  const hasDocSymOrRoman = parsedLines.some(
+    (pl) =>
+      (pl.kind === 'heading_sym' && (pl.sym === '●' || pl.sym === '■')) ||
+      pl.kind === 'heading_roman'
+  );
+  const capAlphaItems = [];
+  for (let idx = startIdx; idx < parsedLines.length; idx++) {
+    const pl = parsedLines[idx];
+    if (pl.kind === 'outline_sub' && pl.indent === 0 && /^[A-Z]\.$/.test(pl.marker || '')) {
+      capAlphaItems.push({ idx, marker: pl.marker });
+    }
+  }
+  const hasCapAlphaSeries = capAlphaItems.length >= 2 && capAlphaItems.some((c) => c.marker === 'A.');
+  let hasStructAboveFirstAlpha = false;
+  if (hasCapAlphaSeries) {
+    const firstAlphaIdx = capAlphaItems[0].idx;
+    for (let idx = startIdx; idx < firstAlphaIdx; idx++) {
+      const pl = parsedLines[idx];
+      if (
+        pl.kind === 'heading_sym' ||
+        pl.kind === 'heading_roman' ||
+        pl.kind === 'heading_num_candidate' ||
+        (pl.kind === 'heading' && pl.level >= 2)
+      ) {
+        hasStructAboveFirstAlpha = true;
+        break;
+      }
+    }
+  }
+  const capAlphaAsTopLevel = hasCapAlphaSeries && !hasDocSymOrRoman && !hasStructAboveFirstAlpha;
+  let activeCircledPass = null; // { level, ordinal, hadProse }
+  const hasFollowingCircledTwo = (fromIdx) => {
+    for (let j = fromIdx + 1; j < parsedLines.length; j++) {
+      const pl = parsedLines[j];
+      if (pl.kind === 'heading_sym' || pl.kind === 'heading_roman' || pl.kind === 'heading_num_candidate') break;
+      if (pl.kind === 'heading' && pl.level <= 2) break;
+      if (pl.kind === 'outline_sub' && pl.marker === '②') return true;
+      if (pl.kind === 'heading' && /^#{1,6}\s+②/.test(pl.text)) return true;
+    }
+    return false;
+  };
 
   const hasOrderedSibling = (idx, targetIndent) => {
     const curKind = parsedLines[idx] ? parsedLines[idx].kind : '';
@@ -1907,6 +2320,9 @@ function refineMarkdownByRules(rawText, options = {}) {
       }
       headingStack.push({ rank: info.level, level: info.level });
       indentStack.length = 0;
+      if (activeCircledPass && info.level <= activeCircledPass.level) {
+        activeCircledPass = null;
+      }
       processedLines.push(info.text);
       continue;
     }
@@ -1918,11 +2334,13 @@ function refineMarkdownByRules(rawText, options = {}) {
         const isPrimarySym = info.sym === '●' || info.sym === '■' || (!hasTopLevelSymOrRoman && info.sym === '◩');
         const minLvl = isPrimarySym ? 1 : 2;
         const hLine = pushHeadingRank(isPrimarySym ? 1 : 2, minLvl, titleWithSym);
+        activeCircledPass = null;
         processedLines.push(hLine || `${'#'.repeat(minLvl)} ${titleWithSym}`);
         continue;
       }
       if (allowPromote && info.kind === 'heading_roman') {
         const hLine = pushHeadingRank(1, 1, info.title);
+        activeCircledPass = null;
         processedLines.push(hLine || `# ${info.title}`);
         continue;
       }
@@ -1933,6 +2351,9 @@ function refineMarkdownByRules(rawText, options = {}) {
         const isOrphanLongNum1 = info.numVal === 1 && info.title.length > 20 && !hasOrderedSibling(i, 0);
         if (!isOrphanLongNum1) {
           const hLine = pushHeadingRank(2, 2, `${info.num}. ${info.title}`);
+          if (activeCircledPass && headingStack.length > 0 && headingStack[headingStack.length - 1].level <= activeCircledPass.level) {
+            activeCircledPass = null;
+          }
           processedLines.push(hLine || `## ${info.num}. ${info.title}`);
           continue;
         }
@@ -1945,24 +2366,60 @@ function refineMarkdownByRules(rawText, options = {}) {
         }
       }
       if (info.kind === 'outline_sub') {
-        const isHalfParenSub = info.indent === 0 && /^\d{1,2}\)$/.test(info.marker || '') && info.canBeHeading;
-        const isFullParenSub = info.indent === 0 && /^\(\d{1,2}\)$/.test(info.marker || '') && info.canBeHeading;
-        const isAlphaSub = info.indent === 0 && /^[A-Za-z]\.$/.test(info.marker || '') && info.canBeHeading;
+        const isCircledSub = /^[①-⑳]$/.test(info.marker || '') && info.canBeHeading;
+        const isHalfParenMarker = info.indent === 0 && /^\d{1,2}\)$/.test(info.marker || '');
+        const isCapAlpha = info.indent === 0 && /^[A-Z]\.$/.test(info.marker || '');
+        const isAlphaSub = info.indent === 0 && /^[A-Za-z]\.$/.test(info.marker || '');
+        const effCanBeHeading =
+          info.canBeHeading ||
+          (isCapAlpha && hasCapAlphaSeries && info.body.length <= 36 && !/[?!]/.test(info.body) && (info.body.match(/,/g) || []).length < 2);
+        const isHalfParenSub = isHalfParenMarker && effCanBeHeading;
+        const isFullParenSub = info.indent === 0 && /^\(\d{1,2}\)$/.test(info.marker || '') && effCanBeHeading;
         const allowFromBullet = !info.fromBullet || (hasExplicitFullParenHeading && !/[.?!다요죠함음]$/.test(info.body));
         const inActiveSiblingList =
+          !isCircledSub &&
           indentStack.some((w) => w <= info.indent) &&
           !((isHalfParenSub || isFullParenSub || isAlphaSub) && headingStack.some((h) => h.level >= 2));
+
+        if (allowPromote && isCapAlpha && capAlphaAsTopLevel && allowFromBullet && effCanBeHeading) {
+          headingStack.length = 0;
+          indentStack.length = 0;
+          activeCircledPass = null;
+          headingStack.push({ rank: 1, level: 1 });
+          processedLines.push(`# ${info.marker} ${info.body}`);
+          continue;
+        }
+
         const shouldPromoteToHeading =
           allowPromote &&
           allowFromBullet &&
-          info.canBeHeading &&
-          maxHeadingLevel >= 3 &&
+          effCanBeHeading &&
+          !isContiguousProseListAt(parsedLines, i, null) &&
+          (isCircledSub ? maxHeadingLevel >= 2 : maxHeadingLevel >= 3) &&
           !inActiveSiblingList &&
-          (!hasExistingHeadings || headingStack.length > 0);
+          (isCircledSub || !hasExistingHeadings || headingStack.length > 0);
 
         if (shouldPromoteToHeading) {
-          const hLine = pushHeadingRank(info.headingRank, 3, `${info.marker} ${info.body}`);
+          let useRank = info.headingRank;
+          let useMin = isCircledSub ? 2 : 3;
+          if (isCircledSub) {
+            const ord = info.marker.charCodeAt(0) - 0x2460 + 1;
+            if (activeCircledPass && activeCircledPass.ordinal >= 2 && activeCircledPass.hadProse && ord === 1 && hasFollowingCircledTwo(i)) {
+              useRank = activeCircledPass.level + 0.25;
+              useMin = Math.min(maxHeadingLevel, activeCircledPass.level + 1);
+            }
+          }
+          const hLine = pushHeadingRank(useRank, useMin, `${info.marker} ${info.body}`);
           if (hLine) {
+            if (isCircledSub) {
+              const ord = info.marker.charCodeAt(0) - 0x2460 + 1;
+              const pushedLvl = headingStack[headingStack.length - 1].level;
+              if (!activeCircledPass || pushedLvl <= activeCircledPass.level) {
+                activeCircledPass = { level: pushedLvl, ordinal: ord, hadProse: false };
+              }
+            } else if (activeCircledPass && headingStack.length > 0 && headingStack[headingStack.length - 1].level <= activeCircledPass.level) {
+              activeCircledPass = null;
+            }
             processedLines.push(hLine);
             continue;
           }
@@ -1980,6 +2437,9 @@ function refineMarkdownByRules(rawText, options = {}) {
         const tabs = opts.spacesToTabs ? '\t'.repeat(tabDepth) : '  '.repeat(tabDepth);
         if (/^\d{1,2}\)$/.test(info.marker || '')) {
           processedLines.push(`${tabs}${info.marker} ${info.body}`);
+        } else if (isGeneralDoc && tabDepth === 0) {
+          const prefix = info.marker && info.marker !== '-' ? `${info.marker} ` : '';
+          processedLines.push(`${prefix}${info.body}`);
         } else {
           const prefix = info.marker && info.marker !== '-' ? `${info.marker} ` : '';
           processedLines.push(`${tabs}- ${prefix}${info.body}`);
@@ -2002,9 +2462,10 @@ function refineMarkdownByRules(rawText, options = {}) {
         const tabDepth = Math.max(0, indentStack.length - 1);
         const tabs = opts.spacesToTabs ? '\t'.repeat(tabDepth) : '  '.repeat(tabDepth);
         const hasSibling = hasOrderedSibling(i, info.indent);
-        const convertToBullet =
+        const convertToBullet = !isGeneralDoc && (
           (autoNumStyle === 'to_bullet' && info.indent > 0) ||
-          (autoNumStyle === 'smart' && info.numVal === 1 && !hasSibling);
+          (autoNumStyle === 'smart' && info.numVal === 1 && !hasSibling)
+        );
         if (convertToBullet) {
           processedLines.push(`${tabs}- ${info.body}`);
         } else {
@@ -2027,20 +2488,67 @@ function refineMarkdownByRules(rawText, options = {}) {
         const tabDepth = Math.max(0, indentStack.length - 1);
         const tabs = opts.spacesToTabs ? '\t'.repeat(tabDepth) : '  '.repeat(tabDepth);
         let bodyOut = info.body;
-        if (autoNumStyle !== 'keep') {
-          const dupNum = bodyOut.match(/^1\.\s+(.+)$/);
-          if (dupNum) bodyOut = dupNum[1];
+        const boldOrPlainHalf = bodyOut.match(/^(?:\*\*(\d{1,2}\))\*\*\s*(.+)|(\*\*)?(\d{1,2}\))\s*(.+))$/);
+        if (boldOrPlainHalf && autoNumStyle !== 'to_bullet') {
+          const hTok = boldOrPlainHalf[1] || boldOrPlainHalf[4];
+          const hRest = boldOrPlainHalf[1] ? boldOrPlainHalf[2] : (boldOrPlainHalf[3] ? `**${boldOrPlainHalf[5]}` : boldOrPlainHalf[5]);
+          processedLines.push(`${tabs}${hTok} ${hRest}`);
+          continue;
         }
-        processedLines.push(`${tabs}- ${bodyOut}`);
+        const boldOrPlainNum = bodyOut.match(/^(?:\*\*(\d{1,2})\.\*\*\s*(.+)|(\*\*)?(\d{1,2})\.\s*(.+))$/);
+        if (boldOrPlainNum) {
+          const nv = parseInt(boldOrPlainNum[1] || boldOrPlainNum[4], 10);
+          const isBoldWrap = !!boldOrPlainNum[3];
+          const numRest = boldOrPlainNum[1] ? boldOrPlainNum[2] : (isBoldWrap ? `**${boldOrPlainNum[5]}` : boldOrPlainNum[5]);
+          if (nv >= 2 && autoNumStyle !== 'to_bullet') {
+            processedLines.push(`${tabs}${nv}. ${numRest}`);
+            continue;
+          }
+          if (nv === 1) {
+            let hasSeq2 = false;
+            const curW = info.indent;
+            for (let k = i + 1; k < Math.min(rawLines.length, i + 80); k++) {
+              const rawK = rawLines[k];
+              if (!rawK.trim()) continue;
+              if (/^#{1,6}\s+/.test(rawK.trim())) break;
+              const plK = parsedLines[k];
+              if (plK && plK.kind === 'heading') break;
+              const kLead = rawK.match(/^[ \t]*/)[0];
+              const kW = getIndentWidth(kLead);
+              if (kW < curW) break;
+              if (kW === curW && /^(?:(?:-\s+|[ㆍ·•]\s*))?(?:\*\*)?2\.\s*/.test(rawK.slice(kLead.length))) {
+                hasSeq2 = true;
+                break;
+              }
+            }
+            if ((hasSeq2 || isBoldWrap || isGeneralDoc) && autoNumStyle !== 'to_bullet') {
+              processedLines.push(`${tabs}1. ${numRest}`);
+              continue;
+            }
+            if (autoNumStyle !== 'keep') {
+              bodyOut = numRest;
+            }
+          }
+        }
+        if (isGeneralDoc && tabDepth === 0 && (bodyOut.length >= 26 || /[.?!。]["'”’)]*$/.test(bodyOut))) {
+          processedLines.push(bodyOut);
+        } else {
+          processedLines.push(`${tabs}- ${bodyOut}`);
+        }
         continue;
       }
     } else if (opts.spacesToTabs && info.kind === 'bullet') {
       const tabDepth = Math.floor(info.indent / 2);
-      processedLines.push(`${'\t'.repeat(tabDepth)}- ${info.body}`);
+      if (isGeneralDoc && tabDepth === 0) {
+        processedLines.push(info.body);
+      } else {
+        processedLines.push(`${'\t'.repeat(tabDepth)}- ${info.body}`);
+      }
       continue;
     }
 
     // Plain or heading or quote
+    if (activeCircledPass) activeCircledPass.hadProse = true;
     if (info.kind === 'plain') {
       indentStack.length = 0;
       // Preserve intentional tab indentation if not list, else trim leading copy-paste clutter spaces
@@ -2069,7 +2577,8 @@ function refineMarkdownByRules(rawText, options = {}) {
 
   // Collapse 3+ consecutive newlines to 2 (1 blank line)
   let joined = finalLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-  const head = frontmatter || generatedFm;
+  const rawHead = frontmatter || generatedFm;
+  const head = applyDocProfileFrontmatter(rawHead, isGeneralDoc, !!opts.useSelectionOnly);
   if (head) {
     const cleanHead = head.endsWith('\n') ? head : head + '\n';
     return cleanHead + (joined ? joined + '\n' : '');
@@ -2175,7 +2684,23 @@ function getHeadingGuideForAi(headingScope = 'h1_h6') {
      - **제목4~6('#### ' ~ '###### ')**: **세부 소주제·보충·참고 소제목** (단순 문장·설명은 제목으로 올리지 말 것)`;
 }
 
-function buildGlobalOutlinePlanPrompt(fullBody, headingScope = 'h1_h6', customNote = '') {
+function detectRecommendedDocProfile(rawText) {
+  const { body } = splitFrontmatter(String(rawText || ''));
+  const lines = body.replace(/\r\n/g, '\n').split('\n');
+  let dashCount = 0;
+  let proseCount = 0;
+  for (const l of lines) {
+    const t = l.trim();
+    if (!t) continue;
+    if (/^-\s+/.test(l)) dashCount++;
+    else if (t.length >= 40 && /(?:다|요|죠|까|네|라)\.$/.test(t) && !/^#/.test(t) && !/^\d+[.)]\s/.test(t)) {
+      proseCount++;
+    }
+  }
+  return (proseCount >= 6 && (dashCount <= 1 || proseCount >= dashCount * 2)) ? 'general' : 'sermon';
+}
+
+function buildGlobalOutlinePlanPrompt(fullBody, headingScope = 'h1_h6', customNote = '', docProfile = 'sermon') {
   const maxSrc = 120000;
   let bodyForPlan = fullBody;
   if (fullBody.length > maxSrc) {
@@ -2195,16 +2720,23 @@ ${getHeadingGuideForAi(headingScope)}
    - 본문 전체에 대단원(서론/본론) 없이 바로 '■ ...' 대지들로 이어진다면 그 대지 자체가 **'# '(제목1)** 부터 시작하십시오.
    - 옵시디언 자동 번호('1. 본문 문장...')나 단순 열거 항목, 성경 구절 인용, 예화 스토리, 설명 문장은 **절대 제목으로 올리지 마십시오.**
 3. **출력 형식**:
-   - 인사말·설명·코드블록(\`\`\`) 없이, 문서 등장 순서대로 **'# ~ ######' 제목 줄만** 1줄에 하나씩 출력하십시오.${customNote ? `\n4. 사용자 추가 지시: ${customNote}` : ''}
+   - 인사말·설명·코드블록(\`\`\`) 없이, 문서 등장 순서대로 **'# ~ ######' 제목 줄만** 1줄에 하나씩 출력하십시오.${docProfile === 'general' ? '\n4. [일반 문서 양식]: 일반 원고·단행본이므로 서술 문단에 마인드맵용 \'- \'(대지 불릿)를 붙이지 말고 평문 문단으로 두십시오.' : ''}${customNote ? `\n${docProfile === 'general' ? '5' : '4'}. 사용자 추가 지시: ${customNote}` : ''}
 
 [전체 노트 원문]
 ${bodyForPlan}`;
 }
 
-function buildAiPrompt(mode, chunkText, customNote, headingScope = 'h1_h6', autoNumberedStyle = 'smart', contextObj = null) {
+function buildAiPrompt(mode, chunkText, customNote, headingScope = 'h1_h6', autoNumberedStyle = 'smart', contextObj = null, docProfile = 'sermon') {
   const autoNumNote = autoNumberedStyle === 'to_bullet'
     ? `4. 옵시디언 자동 목록 기능 등으로 들여쓰기된 '1. / 2.' 숫자 목록은 문맥상 반드시 번호가 필요한 대지 제목이 아니면 모두 '- ' 일반 목록으로 바꾸고, 원본에 숫자가 없던 곳에 임의로 새 번호를 붙이지 마십시오.`
     : `4. 원본에 숫자가 없는 제목이나 목록에 임의로 '1.', '2.', '①' 등 새 번호를 매핑하지 마십시오. 반대로 옵시디언 자동 목록 완성 때문에 잘못 들어간 단독 '1.'이나 '- 1.' 중복 번호는 '- ' 일반 목록으로 복원하십시오.`;
+
+  const profileNote = docProfile === 'general'
+    ? `\n\n[문서 양식: 📄 일반 문서 (목사님 원고 · 단행본 · 강의안)]
+- 이 문서는 개인 설교 마인드맵이 아닌 **일반 원고/단행본**입니다.
+- **절대 문단 앞에 마인드맵용 0단계 '- '(V 대지 기호)를 새로 붙이지 마십시오.** (원본에 쓸데없이 붙은 '- ' 서술 문장은 일반 평문 단락으로 푸십시오.)
+- 본문 설명·예화·인용은 자연스러운 일반 평문 단락으로 유지하고, 과도하게 끊긴 줄바꿈·빈 줄을 매끄럽게 정돈하며, 명확한 개요(Ⅰ., 1., (1), ①, 가. 등)의 **제목(#~######) 계층과 원본 강조 서식(굵게·밑줄·형광펜·표)** 만 깔끔하게 살리십시오.`
+    : '';
 
   const commonRules = `당신은 목회자/신학자의 옵시디언 설교·성경연구 노트 편집 도우미입니다.
 아래 원문 텍스트를 손실 없이 다듬어 마크다운으로만 출력하십시오.
@@ -2231,12 +2763,12 @@ ${autoNumNote}
     : `[이번 작업: AI 맞춤법, 구조화 정리]
 - 전체 내용의 논리 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악해 계층을 잡으면서, 붙은 띄어쓰기·복붙 오타·끊긴 줄바꿈과 문단을 교정·구조화하십시오:`;
 
-  return `${commonRules}
+  return `${commonRules}${profileNote}
 ${globalPlanBlock}${prevContextBlock}
 ${modeLead}
 ${headingGuide}
   2. **끊긴 줄바꿈·어색한 빈 줄(\\n\\n) 연결 및 밑줄 변환 (매우 중요)**:
-     - PDF·HWP·DOCX 변환 때문에 **한 문장이나 한 성경 본문 인용, \`<u>...</u>\` / \`[...]{.underline}\` / \`*\*...**\`, 부사·관형어·연결어미 중간이 줄바꿈이나 빈 줄(\\n\\n)로 토막나 있으면** (예: \`>(잠 1:10-19) (10) ... (11) 그들이\\n\\n네게 말하기를 ...\`, \`시간을 소중히\\n\\n여길 수 있다.\`, \`그리스도 앞에서 서야\\n\\n한다.\`, \`...보면 그\\n\\n시간이 ...\`, \`*\*... 제 삼\\n\\n일에 살아나야...\*\*\`), **원본의 어색한 줄바꿈과 빈 줄을 그대로 두지 말고 문장·구절이 끝날 때까지 띄어쓰기 1칸으로 자연스럽게 한 문장·한 인용 문단으로 이어 붙이십시오.**
+     - PDF·HWP·DOCX 변환 때문에 **한 문장이나 한 성경 본문 인용, \`<u>...</u>\` / \`[...]{.underline}\` / \`*\*...**\`, 부사·관형어·연결어미 중간이 줄바꿈이나 빈 줄(\\n\\n)로 토막나 있으면** (예: \`(잠 1:10-19) (10) ... (11) 그들이\\n\\n네게 말하기를 ...\`, \`시간을 소중히\\n\\n여길 수 있다.\`, \`그리스도 앞에서 서야\\n\\n한다.\`, \`...보면 그\\n\\n시간이 ...\`, \`*\*... 제 삼\\n\\n일에 살아나야...\*\*\`), **원본의 어색한 줄바꿈과 빈 줄을 그대로 두지 말고 문장·구절이 끝날 때까지 띄어쓰기 1칸으로 자연스럽게 한 문장·한 인용 문단으로 이어 붙이십시오.**
      - Pandoc 밑줄(\`[텍스트]{.underline}\`)은 반드시 옵시디언 HTML 밑줄 태그인 \`<u>텍스트</u>\` 형태로 유지·변환하고, \`{.underline}\` 문법을 그대로 남기지 마십시오.
   3. **번호·대지 기호 중복, \`-.\` 기호 및 공백 누락 방지 (매우 중요)**:
      - '1) 제목', '2) 제목', '1. 제목', '2. 제목' 앞에 **절대 '- '를 붙이지 마십시오** ('- 1) ...' ❌ → '1) ...' 또는 '\\t1) ...' ⭕, 제목이면 '## 1) ...'). '- 1)'로 쓰면 뷰어에서 '✓ 1)'처럼 대지 기호와 번호가 겹쳐 나옵니다.
@@ -2249,8 +2781,9 @@ ${headingGuide}
   5. **동일 기호 = 동일 제목(#) 및 번호 체계 문서 전체 일관성 (매우 중요)**:
      - 문서 전체에서 같은 기호('■ ...', '● ...', '◆ ...', '◩ ...')가 하나라도 제목1('# ')이면 나머지 모든 같은 기호 형제도 똑같이 '# ...'로 통일하고, 같은 대지 안의 '1., 2., ... 6., 7.' 형제도 일부만 '## 6.'이 되고 나머지가 평문으로 남지 않게 통일하십시오.
      - 문서 상단에서 \`(1) ...\`, \`(2) ...\`, \`(3) ...\`이나 \`A. ...\`, \`B. ...\`, \`a. ...\`이 각각 \`###\`, \`####\`, \`#####\` 제목으로 올라갔다면, 문서 하단 다른 대지(\`## 2.\`) 아래에 \`- (1) ...\`, \`- (2) ...\`처럼 불릿이 잘못 붙어 있더라도 절대 본문 목록으로 두지 말고 똑같이 \`### (1) ...\`, \`### (2) ...\` 제목으로 통일하십시오.
+     - **원문자(①, ②, ③...) 제목 승격**: \`①, ②, ③...\` 원문자 숫자는 본문이나 일반 목록(\`- ①\`)으로 두지 말고, 바로 위에 있는 상위 제목(\`#\`, \`##\`, \`###\` 등)을 찾아 반드시 그 한 단계 아래 제목(\`## ①\`, \`### ①\`, \`#### ①\` 등)으로 승격시키십시오.
      - 상위 번호(예: ⑪)가 목록인데 하위 항목(가., 나.)만 제목(####)으로 뒤집히지 않게 일관성을 유지하십시오.
-  6. 성경 구절: '(창 47:7-10) 말씀...' 형태(목록 내부라면 '\\t- (창 26:1) 말씀...')로 통일하고, '>' 인용 기호를 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.
+  6. 성경 구절: '(창 47:7-10) 말씀...' 형태(목록 내부라면 '\\t- (창 26:1) 말씀...')로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.
 
 [현재 편집할 구간]
 ${chunkText}`;
@@ -2263,6 +2796,7 @@ class SermonMdRefineModal extends Modal {
     this.ctx = targetContext; // { file, editor, selectionText, fullText }
     this.mode = plugin.settings.defaultMode || 'rules';
     this.opts = {
+      docProfile: plugin.settings.docProfile || 'sermon',
       headingLevelScope: plugin.settings.headingLevelScope || 'h1_h6',
       autoNumberedStyle: plugin.settings.autoNumberedStyle || 'smart',
       mergeBrokenLines: !!plugin.settings.mergeBrokenLines,
@@ -2290,6 +2824,41 @@ class SermonMdRefineModal extends Modal {
       ? `대상: ${this.ctx.file.basename} (선택 영역 ${this.ctx.selectionText.length.toLocaleString()}자)`
       : `대상: ${this.ctx.file.basename} (전체 ${this.ctx.fullText.length.toLocaleString()}자)`;
     contentEl.createDiv({ cls: 'smr-target-badge', text: targetDesc });
+
+    // Document profile selector (내 설교문 양식 vs 일반 문서/원고)
+    const profileGroup = contentEl.createDiv({ cls: 'smr-profile-group' });
+    const profiles = [
+      { id: 'sermon', title: '📝 내 설교문 양식', sub: 'V 대지 기호·\\t 마인드맵 계층 · 설교 개요 중심' },
+      { id: 'general', title: '📄 일반 문서 (목사님 원고 · 단행본)', sub: 'V 대지 기호 제거 · 평문/원본 서식 · 제목(#)·줄바꿈 정리' }
+    ];
+    const profileBtns = [];
+    const hintBar = contentEl.createDiv({ cls: 'smr-profile-hint' });
+    const hintText = hintBar.createSpan({ text: '💡 서술형 일반 원고에 가까워 [📄 일반 문서] 양식을 추천합니다.' });
+    const hintBtn = hintBar.createEl('button', { cls: 'smr-profile-hint-btn', type: 'button', text: '일반 문서로 전환' });
+
+    const srcForHint = this.opts.useSelectionOnly && this.ctx.selectionText ? this.ctx.selectionText : this.ctx.fullText;
+    const recProfile = detectRecommendedDocProfile(srcForHint);
+    const syncProfileUi = () => {
+      profileBtns.forEach((b, idx) => b.toggleClass('is-active', profiles[idx].id === this.opts.docProfile));
+      hintBar.style.display = (this.opts.docProfile === 'sermon' && recProfile === 'general') ? 'flex' : 'none';
+    };
+    for (const p of profiles) {
+      const btn = profileGroup.createEl('button', { cls: 'smr-profile-btn', type: 'button' });
+      btn.createDiv({ cls: 'smr-mode-title', text: p.title });
+      btn.createDiv({ cls: 'smr-profile-sub', text: p.sub });
+      btn.onclick = () => {
+        this.opts.docProfile = p.id;
+        syncProfileUi();
+        if (this.mode === 'rules') runBtn.click();
+      };
+      profileBtns.push(btn);
+    }
+    hintBtn.onclick = () => {
+      this.opts.docProfile = 'general';
+      syncProfileUi();
+      if (this.mode === 'rules') runBtn.click();
+    };
+    syncProfileUi();
 
     // Mode cards
     const modeGroup = contentEl.createDiv({ cls: 'smr-mode-group' });
@@ -2553,6 +3122,15 @@ class SermonMdRefinerSettingTab extends PluginSettingTab {
         .onChange(async (v) => { s.defaultMode = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
+      .setName('기본 문서 양식')
+      .setDesc('내 설교문 양식(V 대지 기호·마인드맵 계층) 또는 일반 문서(V 제거·평문·개요 제목 유지)를 선택합니다.')
+      .addDropdown((d) => d
+        .addOption('sermon', '📝 내 설교문 양식 (V·마인드맵)')
+        .addOption('general', '📄 일반 문서 (목사님 원고·단행본)')
+        .setValue(s.docProfile || 'sermon')
+        .onChange(async (v) => { s.docProfile = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
       .setName('기본 제목 계층 범위 (H1~H6)')
       .setDesc('노트 개요를 마크다운 제목(# ~ ######) 몇 단계까지 변환할지 설정합니다. (heading-colors.css 색상과 자동 연동)')
       .addDropdown((d) => d
@@ -2794,11 +3372,13 @@ class SermonMdRefinerPlugin extends Plugin {
     const extraOpts = (stripQuotesOrOpts && typeof stripQuotesOrOpts === 'object') ? stripQuotesOrOpts : {};
     const effectiveScope = headingScope || extraOpts.headingLevelScope || this.settings.headingLevelScope || 'h1_h6';
     const effectiveNumStyle = autoNumberedStyle || extraOpts.autoNumberedStyle || this.settings.autoNumberedStyle || 'smart';
+    const effectiveDocProfile = extraOpts.docProfile || this.settings.docProfile || 'sermon';
     const effectiveStripQuotes = typeof stripQuotesOrOpts === 'boolean'
       ? stripQuotesOrOpts
       : (typeof extraOpts.stripVerseBlockquotes === 'boolean' ? extraOpts.stripVerseBlockquotes : !!this.settings.stripVerseBlockquotes);
 
     const effectiveRuleOpts = Object.assign({}, this.settings, extraOpts, {
+      docProfile: effectiveDocProfile,
       headingLevelScope: effectiveScope,
       autoNumberedStyle: effectiveNumStyle,
       stripVerseBlockquotes: effectiveStripQuotes
@@ -2806,6 +3386,7 @@ class SermonMdRefinerPlugin extends Plugin {
 
     // Non-destructive prep: keep raw outline intact so AI sees real semantics, while unescaping Pandoc artifacts and stitching hard-wrapped half-sentences
     const { frontmatter: origFm, body: origBody } = splitFrontmatter(rawText);
+    const origQuotedKeys = extractQuotedVerseKeys(origBody);
     let cleanBody = normalizeHwpDashBullets(unescapePandocMarkdown(decodeHtmlEntities(origBody)))
       .replace(/\r\n/g, '\n')
       .replace(/[\u00A0\u200B\uFEFF]/g, (ch) => (ch === '\u00A0' ? ' ' : ''));
@@ -2835,7 +3416,7 @@ class SermonMdRefinerPlugin extends Plugin {
         onProgress('🧭 전체 문서 내용 통독 및 제목1(대지)~제목6 하이어라키 설계 중...');
       }
       try {
-        const planPrompt = buildGlobalOutlinePlanPrompt(cleanBody, effectiveScope, customNote);
+        const planPrompt = buildGlobalOutlinePlanPrompt(cleanBody, effectiveScope, customNote, effectiveDocProfile);
         const rawPlan = await this.callGeminiChunk(planPrompt, keys, abortSignal);
         const planLines = rawPlan.split('\n').map((l) => l.trim()).filter((l) => /^#{1,6}\s+/.test(l));
         if (planLines.length > 0) {
@@ -2864,13 +3445,16 @@ class SermonMdRefinerPlugin extends Plugin {
       const prompt = buildAiPrompt(mode, chunks[i], customNote, effectiveScope, effectiveNumStyle, {
         globalOutlinePlan,
         prevTail
-      });
+      }, effectiveDocProfile);
       const refined = await this.callGeminiChunk(prompt, keys, abortSignal);
       outChunks.push(refined);
     }
 
     let assembled = outChunks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
     if (assembled) {
+      if (!effectiveStripQuotes) {
+        assembled = stripAiAddedVerseBlockquotes(assembled, origQuotedKeys);
+      }
       if (onProgress) {
         onProgress('🔍 전체 문서 규칙 마무리·성구·일관성 2차 검수 중...');
       }
@@ -2878,7 +3462,8 @@ class SermonMdRefinerPlugin extends Plugin {
         // Apply rule options (line-merge, tabs, auto-number clean, Bible refs, strip '>', reconcile) WITHOUT overriding AI's H1~H6 semantic design
         const postBody = refineMarkdownByRules(assembled, Object.assign({}, effectiveRuleOpts, {
           addMissingFrontmatter: false,
-          preserveExistingHeadings: true
+          preserveExistingHeadings: true,
+          useSelectionOnly: true
         }));
         assembled = postBody.trim();
       } else {
@@ -2893,6 +3478,7 @@ class SermonMdRefinerPlugin extends Plugin {
             : l
         ));
         postLines = reconcileDocumentStructure(postLines, {
+          docProfile: effectiveDocProfile,
           normalizeHierarchy: effectiveRuleOpts.normalizeHierarchy !== false,
           spacesToTabs: effectiveRuleOpts.spacesToTabs !== false,
           headingLevelScope: effectiveScope,
@@ -2903,8 +3489,9 @@ class SermonMdRefinerPlugin extends Plugin {
     }
 
     const joined = assembled;
-    if (frontmatter) {
-      const cleanHead = frontmatter.endsWith('\n') ? frontmatter : frontmatter + '\n';
+    const finalHead = applyDocProfileFrontmatter(frontmatter, effectiveDocProfile === 'general', !!extraOpts.useSelectionOnly);
+    if (finalHead) {
+      const cleanHead = finalHead.endsWith('\n') ? finalHead : finalHead + '\n';
       return cleanHead + (joined ? joined + '\n' : '');
     }
     return joined ? joined + '\n' : '';

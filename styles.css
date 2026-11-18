@@ -27,6 +27,58 @@
   margin-bottom: 12px;
 }
 
+.smr-profile-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.smr-profile-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.smr-profile-btn.is-active {
+  border-color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 14%, var(--background-primary));
+}
+
+.smr-profile-sub {
+  font-size: 0.75em;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.smr-profile-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+  border-radius: 6px;
+  font-size: 0.82em;
+  background: color-mix(in srgb, var(--interactive-accent) 10%, var(--background-secondary));
+  border: 1px dashed var(--interactive-accent);
+  color: var(--text-normal);
+}
+
+.smr-profile-hint-btn {
+  font-size: 0.9em;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+
 @media (max-width: 600px) {
   .smr-mode-group {
     grid-template-columns: 1fr;
