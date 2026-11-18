@@ -358,6 +358,74 @@ function normalizeHwpDashBullets(text) {
   return out.join('\n');
 }
 
+function splitInlineNumberedItemsPass(lines, isGeneralDoc = false) {
+  const out = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (inFence || !line.trim() || /^\s*(?:>|#{1,6}\s|\|.*\|)/.test(line) || line.trim() === '---') {
+      out.push(line);
+      continue;
+    }
+
+    // 1) Split inline triple-dash items ("---항목1 ---항목2") without touching standalone "---"
+    if (/\s+---(?=[가-힣A-Za-z"'“‘(])/.test(line) || /^---(?=[가-힣A-Za-z"'“‘(])/.test(line.trim())) {
+      const leadWs = line.match(/^[ \t]*/)[0];
+      let work = line.slice(leadWs.length);
+      work = work.replace(/\s+---(?=[가-힣A-Za-z"'“‘(])/g, `\n${leadWs}${isGeneralDoc ? '' : '- '}`);
+      work = work.replace(/^---(?=[가-힣A-Za-z"'“‘(])/, `${leadWs}${isGeneralDoc ? '' : '- '}`);
+      const dashParts = work.split('\n');
+      for (const dp of dashParts) {
+        if (dp.trim()) lines_pushSplitInlineNums(dp, out);
+      }
+      continue;
+    }
+
+    lines_pushSplitInlineNums(line, out);
+  }
+  return out;
+}
+
+function lines_pushSplitInlineNums(line, out) {
+  let work = String(line || '');
+  // Split inline bold-wrapped sequential numbered items: "... 같다.** **6. 교회를..." or "...연약함 **3. 하나님이..."
+  work = work.replace(/([.?!)"'”’가-힣\]\*])\s+(\*\*\d{1,2}[.)]\s*[^*\n]{2,})/g, '$1\n$2');
+  // Split inline plain sequential numbered items after sentence end if line starts with N. or has bold N.: "5. ... 같다. 6. 교회를..."
+  if (/^\s*(?:\*\*)?\d{1,2}\.\s+/.test(work)) {
+    const startNumM = work.match(/^\s*(?:\*\*)?(\d{1,2})\./);
+    let lastNum = startNumM ? parseInt(startNumM[1], 10) : 0;
+    work = work.replace(/([.?!)"'”’]\*\*|[.?!)"'”’])\s+(\d{1,2})\.\s+(?=[가-힣A-Za-z"'“‘(])/g, (full, prevEnd, numStr) => {
+      const nv = parseInt(numStr, 10);
+      if (nv >= lastNum + 1 && nv <= lastNum + 2 && nv <= 30) {
+        lastNum = nv;
+        return `${prevEnd}\n${numStr}. `;
+      }
+      return full;
+    });
+  }
+
+  for (const part of work.split('\n')) {
+    const pTrim = part.trim();
+    if (!pTrim) continue;
+    // Split short/topic bold numbered title from glued trailing body on the same line:
+    // e.g. "**3) 그러나 하나님 앞에서 자기의 의를 드러냄** 하나님 불의하다?" or "**1. 성령을 받을 때...** “기록된바..."
+    const leadWs = part.match(/^[ \t]*/)[0];
+    const boldTopicGlue = pTrim.match(/^(\*\*\d{1,2}[.)]\s*[^*\n]{2,52}\*\*)(\.?)\s+([가-힣A-Za-z“"'(*].{3,})$/);
+    if (boldTopicGlue) {
+      const titleHead = `${boldTopicGlue[1]}${boldTopicGlue[2] || ''}`;
+      out.push(`${leadWs}${titleHead}`);
+      out.push(`${leadWs}${boldTopicGlue[3]}`);
+    } else {
+      out.push(part);
+    }
+  }
+}
+
 function normalizeTightOutlineSpacing(rawTrimmed) {
   let t = String(rawTrimmed || '');
   if (!t) return t;
@@ -454,17 +522,54 @@ function classifyOutlineLine(line) {
     return { kind: 'heading_sym', rank: 1, indent, sym: symHead[1], title: symHead[2], text: trimmed };
   }
 
-  // Numbered line: "1. 본문" (col 0 heading candidate) vs ordered list item ("\t1. ...", long prose, or >15)
-  const numLine = trimmed.match(/^(\d{1,4})\.\s+(.+)$/);
-  if (numLine) {
-    const numVal = parseInt(numLine[1], 10);
-    const bodyText = numLine[2];
+  // Bold-wrapped numbered lines: "**1. 잘못된 지식**", "**1) 욥의 지혜**" -> evaluate inner text identically
+  const boldNumLine = trimmed.match(/^\*\*(\d{1,4})\.\s*(.+?)\*\*(\.?)$/);
+  if (boldNumLine) {
+    const numVal = parseInt(boldNumLine[1], 10);
+    const bodyText = boldNumLine[2].trim();
+    const endsWithPeriodOrSentence = Boolean(boldNumLine[3]) || /[.?!]$/.test(bodyText) || /(?:다|요|죠|까|네|라|니다)$/.test(bodyText);
+    const isShortNounNominal = bodyText.length <= 28 && !boldNumLine[3] && !/[.?!,]/.test(bodyText) && !/(?:다|요|죠|까|네|라)$/.test(bodyText);
     const looksLikeHeading =
       indent === 0 &&
       numVal >= 1 &&
       numVal <= 15 &&
       bodyText.length <= 42 &&
-      !/[.?!다요죠함음]$/.test(bodyText) &&
+      (!endsWithPeriodOrSentence || isShortNounNominal) &&
+      !/%%|\*\*\*|^[([]/.test(bodyText);
+    if (looksLikeHeading) {
+      return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: boldNumLine[1], numVal, title: bodyText, body: bodyText, text: `${boldNumLine[1]}. ${bodyText}` };
+    }
+    return { kind: 'ordered_list', indent, leading, num: boldNumLine[1], numVal, body: `**${bodyText}**${boldNumLine[3] || ''}`, text: trimmed };
+  }
+
+  const boldHalfParen = trimmed.match(/^\*\*(\d{1,2}\))\s*(.+?)\*\*(\.?)$/);
+  if (boldHalfParen) {
+    const bodyText = `${boldHalfParen[2].trim()}${boldHalfParen[3] || ''}`;
+    return {
+      kind: 'outline_sub',
+      rank: 3,
+      headingRank: 3,
+      canBeHeading: isShortSubheadingBody(bodyText, true),
+      indent,
+      leading,
+      marker: boldHalfParen[1],
+      body: bodyText,
+      text: `${boldHalfParen[1]} ${bodyText}`
+    };
+  }
+
+  // Numbered line: "1. 본문" (col 0 heading candidate) vs ordered list item ("\t1. ...", long prose, or >15)
+  const numLine = trimmed.match(/^(\d{1,4})\.\s+(.+)$/);
+  if (numLine) {
+    const numVal = parseInt(numLine[1], 10);
+    const bodyText = numLine[2];
+    const isShortNounNominal = bodyText.length <= 28 && !/[.?!,]/.test(bodyText) && !/(?:다|요|죠|까|네|라)$/.test(bodyText);
+    const looksLikeHeading =
+      indent === 0 &&
+      numVal >= 1 &&
+      numVal <= 15 &&
+      bodyText.length <= 42 &&
+      (!/[.?!다요죠함음]$/.test(bodyText) || isShortNounNominal) &&
       !/%%|\*\*\*|^[([]/.test(bodyText);
     if (looksLikeHeading) {
       return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: numLine[1], numVal, title: bodyText, body: bodyText, text: trimmed };
@@ -806,7 +911,9 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
   const n = nextLine.trim();
   if (!p || !n) return false;
   if (/^(?:#{1,6}\s|```|~~~|\|.*\||---+$|\*\*\*+$|<!--)/.test(p)) return false;
+  if (/^(?:\*\*\d{1,2}[.)]\s+[^*\n]+\*\*|\d{1,2}[.)]\s+\*\*[^*\n]+\*\*)[.?!]?$/.test(p)) return false;
   if (isProtectedLine(nextLine)) return false;
+  if (/^(?:\*\*)?\d{1,2}[.)]\s+/.test(n)) return false;
   if (/^(?:강사|장소|날짜|일시|본문|제목|주제|시간|비고|참고)\s*[:：]/.test(p)) return false;
   if (/^(?:강사|장소|날짜|일시|본문|제목|주제|시간|비고|참고)\s*[:：]/.test(n)) return false;
   if (/%%$/.test(p)) return false;
@@ -1178,13 +1285,14 @@ function isIntroLeadLine(trimmed) {
 }
 
 function reconcileDocumentStructure(lines, opts) {
-  if (!opts || !opts.normalizeHierarchy) return lines.slice();
+  if (!opts || (!opts.normalizeHierarchy && !opts.respectAiHeadings)) return lines.slice();
   let out = lines.slice();
   const scope = opts.headingLevelScope || 'h1_h6';
   const maxHeadingLevel = scope === 'h1_h2' ? 2 : (scope === 'h1_h3' ? 3 : 6);
   const indentUnit = opts.spacesToTabs === false ? '  ' : '\t';
   const autoNumStyle = opts.autoNumberedStyle || 'smart';
   const isGeneralDoc = opts.docProfile === 'general';
+  const skipHeadingRewrite = !!opts.respectAiHeadings;
 
   let fence = false;
   const fenced = out.map((l) => {
@@ -1194,6 +1302,27 @@ function reconcileDocumentStructure(lines, opts) {
     }
     return fence;
   });
+
+  if (skipHeadingRewrite) {
+    // Only apply general-doc V unwrap and H1-start normalization without overriding user-guided AI headings
+    if (isGeneralDoc) {
+      let inF = false;
+      for (let i = 0; i < out.length; i++) {
+        if (/^\s*(?:```|~~~)/.test(out[i])) { inF = !inF; continue; }
+        if (inF) continue;
+        if (/^[ \t]*[✓✔]\s+/.test(out[i])) out[i] = out[i].replace(/^[ \t]*[✓✔]\s+/, '');
+        const mCol0 = out[i].match(/^-\s+(.+)$/);
+        if (mCol0) {
+          const body = mCol0[1].trim();
+          const prevShort = i > 0 && /^-\s+/.test(out[i - 1]) && out[i - 1].length <= 28 && !/[.?!。]$/.test(out[i - 1]);
+          const nextShort = i + 1 < out.length && /^-\s+/.test(out[i + 1]) && out[i + 1].length <= 28 && !/[.?!。]$/.test(out[i + 1]);
+          if (body.length >= 22 || /[.?!。]["'”’)]*$/.test(body) || !(prevShort || nextShort)) out[i] = body;
+        }
+      }
+    }
+    out = normalizeMinHeadingLevelPass(out, true);
+    return out;
+  }
 
   // Pass 0: Normalize missing spaces after ■/1./1) and unwrap "- 1) ..." / "- 1. ..." collisions (avoiding "✓ 1)" in sermon-mindmap)
   for (let i = 0; i < out.length; i++) {
@@ -1378,6 +1507,7 @@ function reconcileDocumentStructure(lines, opts) {
   // 2-outline-parent: If a section has H1/H2 parent and deeper child headings (e.g. #### ①) below a col-0 numeric outline series (1. / 1) / (1)),
   // ensure that intermediate outline series is promoted to the heading level between parent and child (Korea standard: 1. -> 1) -> (1)/①).
   const koreanRankOfFamily = (fam) => {
+    if (isMajorSymbolFamily(fam)) return 1.5;
     if (fam === 'num_dot') return 2;
     if (fam === 'half_paren') return 3;
     if (fam === 'full_paren') return 4;
@@ -1397,38 +1527,52 @@ function reconcileDocumentStructure(lines, opts) {
     }
     const candidatesByFam = new Map();
     const childHeadings = [];
-    const hScope = secParentLevel ? [{ level: secParentLevel, rank: sp.tag ? koreanRankOfFamily(sp.tag.family) : secParentLevel }] : [];
+    const hScope = secParentLevel ? [{ idx: secIdx, level: secParentLevel, rank: sp.tag ? koreanRankOfFamily(sp.tag.family) : secParentLevel }] : [];
     for (let j = secIdx + (secParentLevel ? 1 : 0); j < secEnd; j++) {
       const jp = parsed[j];
-      if (jp.kind === 'heading' && jp.level >= 3) {
+      if (jp.kind === 'heading' && jp.level >= 2) {
         const jRank = jp.tag ? koreanRankOfFamily(jp.tag.family) : jp.level + 0.5;
-        childHeadings.push({ idx: j, level: jp.level, rank: jRank });
+        if (jp.level >= 3) childHeadings.push({ idx: j, level: jp.level, rank: jRank });
         while (hScope.length > 0 && hScope[hScope.length - 1].level >= jp.level) hScope.pop();
-        hScope.push({ level: jp.level, rank: jRank });
+        hScope.push({ idx: j, level: jp.level, rank: jRank });
       } else if (
         jp.tag &&
         NUMERIC_OUTLINE_FAMILIES.has(jp.tag.family) &&
         ((jp.kind === 'bullet' && jp.tabDepth === 0) || (jp.kind === 'other' && !/^[ \t]/.test(out[j]))) &&
         jp.tag.text.length <= 56 &&
-        (!isSentenceOrColonProse(jp.tag.text) || isEligibleOutlineText(jp.tag.family, jp.tag.text))
+        (!isSentenceOrColonProse(jp.tag.text) || isEligibleOutlineText(jp.tag.family, jp.tag.text)) &&
+        !isContiguousProseListAt(parsed, j, fenced)
       ) {
         const famRank = koreanRankOfFamily(jp.tag.family);
         let parentLvl = secParentLevel;
+        let parentScopeIdx = secIdx;
         for (let k = hScope.length - 1; k >= 0; k--) {
           if (hScope[k].rank < famRank) {
             parentLvl = hScope[k].level;
+            parentScopeIdx = hScope[k].idx;
             break;
           }
         }
-        if (!candidatesByFam.has(jp.tag.family)) candidatesByFam.set(jp.tag.family, []);
-        candidatesByFam.get(jp.tag.family).push({ idx: j, text: jp.tag.text, parentLvl });
+        const famBucketKey = `${parentScopeIdx}:${jp.tag.family}`;
+        if (!candidatesByFam.has(famBucketKey)) candidatesByFam.set(famBucketKey, []);
+        candidatesByFam.get(famBucketKey).push({ idx: j, text: jp.tag.text, parentLvl, parentScopeIdx, fam: jp.tag.family });
       }
     }
     if (childHeadings.length > 0 && candidatesByFam.size > 0) {
-      for (const [fam, items] of candidatesByFam.entries()) {
+      for (const items of candidatesByFam.values()) {
+        const fam = items[0].fam;
+        const pScopeIdx = items[0].parentScopeIdx;
+        const pScopeLvl = items[0].parentLvl;
         const famRank = koreanRankOfFamily(fam);
         const firstIdx = items[0].idx;
-        const deeperChild = childHeadings.find((ch) => ch.idx > firstIdx && ch.rank > famRank && ch.level >= 3);
+        let scopeEnd = secEnd;
+        for (let k = firstIdx + 1; k < secEnd; k++) {
+          if (parsed[k].kind === 'heading' && parsed[k].level <= pScopeLvl) {
+            scopeEnd = k;
+            break;
+          }
+        }
+        const deeperChild = childHeadings.find((ch) => ch.idx > firstIdx && ch.idx < scopeEnd && ch.rank > famRank && ch.level >= 3);
         if (!deeperChild) continue;
         const minParentLvl = Math.max(secParentLevel, ...items.map((it) => it.parentLvl));
         if (minParentLvl + 1 > maxHeadingLevel) continue;
@@ -1455,7 +1599,7 @@ function reconcileDocumentStructure(lines, opts) {
       const p = pLines[i];
       if (p.kind === 'heading') {
         const fam = p.tag ? p.tag.family : 'major';
-        const rank = p.tag ? (docAlignRanks[fam] || p.level) : p.level;
+        const rank = isMajorSymbolFamily(fam) ? Math.min(p.level, 1.5) : (p.tag ? (docAlignRanks[fam] || p.level) : p.level);
         while (pStack.length > 0 && pStack[pStack.length - 1].level >= p.level) pStack.pop();
         const activeParent = pStack.length > 0 ? pStack[pStack.length - 1] : { idx: -1, level: 0, family: 'root', rank: 0 };
         scopes[i] = activeParent;
@@ -1532,7 +1676,8 @@ function reconcileDocumentStructure(lines, opts) {
           if (isNumericFam && isContiguousProseListAt(parsed, uIdx, fenced)) return false;
           const fitsNumericHeading =
             isNumericFam &&
-            p.tag.text.length <= 220 &&
+            p.tag.text.length <= 62 &&
+            !/[.?!]["'”’)]*\s+[가-힣“"'(]/.test(p.tag.text.replace(/^\d{1,2}[.)]\s*/, '')) &&
             !/%%|\*\*\*/.test(p.tag.text);
           const fitsNonNumericHeading =
             !isNumericFam &&
@@ -1544,6 +1689,10 @@ function reconcileDocumentStructure(lines, opts) {
         // Preserve an already-uniform section if it has zero unpromoted heading-like siblings
         const levelsHere = new Set(bh.map((h) => h.level));
         if (bh.length > 0 && levelsHere.size === 1 && bh[0].level > parLevel && candidateUnpromoted.length === 0) {
+          continue;
+        }
+        // If this section has zero existing headings for this family and any unpromoted item in it is a long prose item (e.g. 1.~11. prose + short 12.~13.), don't cherry-pick 12.~13.
+        if (bh.length === 0 && pBucket.unpromoted.length > candidateUnpromoted.length && isNumericFam) {
           continue;
         }
         const localTarget = bh.length > 0
@@ -2119,6 +2268,34 @@ function reconcileDocumentStructure(lines, opts) {
     }
   }
 
+  // Pass 6: In general docs, AI-preserved headings, or orphaned H2 major symbols (## ■ / ## ● / ## Ⅰ.),
+  // normalize heading hierarchy to start at H1 ('# ') and compress any skipped levels cleanly.
+  const hasH2MajorOnly = !out.some((l) => /^#\s+/.test(l.trim())) && out.some((l) => /^##\s+(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(l.trim()));
+  const shouldShiftToH1 = isGeneralDoc || !!opts.preserveExistingHeadings || hasH2MajorOnly;
+  out = normalizeMinHeadingLevelPass(out, shouldShiftToH1);
+
+  return out;
+}
+
+function normalizeMinHeadingLevelPass(lines, shiftToH1 = false) {
+  const out = lines.slice();
+  let inFence = false;
+  const heads = [];
+  for (let i = 0; i < out.length; i++) {
+    if (/^\s*(?:```|~~~)/.test(out[i])) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    const m = out[i].match(/^(#{1,6})\s+(.+)$/);
+    if (m) heads.push({ idx: i, level: m[1].length, text: m[2] });
+  }
+  if (!heads.length) return out;
+  const minLvl = Math.min(...heads.map((h) => h.level));
+  if (shiftToH1 && minLvl > 1) {
+    const shift = minLvl - 1;
+    for (const h of heads) {
+      h.level = Math.max(1, h.level - shift);
+      out[h.idx] = `${'#'.repeat(h.level)} ${h.text}`;
+    }
+  }
   return out;
 }
 
@@ -2158,6 +2335,8 @@ function refineMarkdownByRules(rawText, options = {}) {
   if (opts.stripVerseBlockquotes) {
     rawLines = rawLines.map((l) => normalizeBibleRefsInLine(l, false, true));
   }
+  const isGeneralDoc = opts.docProfile === 'general';
+  rawLines = splitInlineNumberedItemsPass(rawLines, isGeneralDoc);
   if (opts.mergeBrokenLines) {
     rawLines = mergeBrokenLinesPass(rawLines, opts.vaultBasePath || '');
   }
@@ -2170,7 +2349,6 @@ function refineMarkdownByRules(rawText, options = {}) {
   const scope = opts.headingLevelScope || 'h1_h6';
   const maxHeadingLevel = scope === 'h1_h2' ? 2 : (scope === 'h1_h3' ? 3 : 6);
   const autoNumStyle = opts.autoNumberedStyle || 'smart';
-  const isGeneralDoc = opts.docProfile === 'general';
 
   // First pass: optional frontmatter extraction if missing
   let generatedFm = '';
@@ -2315,15 +2493,27 @@ function refineMarkdownByRules(rawText, options = {}) {
     }
 
     if (info.kind === 'heading') {
-      while (headingStack.length > 0 && headingStack[headingStack.length - 1].rank >= info.level) {
+      const hTitle = info.text.replace(/^#{1,6}\s+/, '');
+      const hasSymInH = /^[■●◆▲▶★◎◩]/.test(hTitle) || /^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]|[IVX]{1,4})\.\s/.test(hTitle);
+      const isHalfParenH = /^\d{1,2}\)\s/.test(hTitle);
+      const isFullParenH = /^\(\d{1,2}\)\s/.test(hTitle);
+      const isCircledH = /^[①-⑳]\s/.test(hTitle);
+      const effRank = hasSymInH
+        ? Math.min(info.level, 1.5)
+        : (isHalfParenH ? 3 : (isFullParenH ? 3.5 : (isCircledH ? 4.5 : info.level)));
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1].rank >= effRank) {
         headingStack.pop();
       }
-      headingStack.push({ rank: info.level, level: info.level });
+      const parentLvl = headingStack.length > 0 ? headingStack[headingStack.length - 1].level : 0;
+      const adjLevel = (isHalfParenH || isFullParenH || isCircledH) && parentLvl >= info.level && parentLvl + 1 <= maxHeadingLevel
+        ? parentLvl + 1
+        : info.level;
+      headingStack.push({ rank: effRank, level: adjLevel });
       indentStack.length = 0;
-      if (activeCircledPass && info.level <= activeCircledPass.level) {
+      if (activeCircledPass && adjLevel <= activeCircledPass.level) {
         activeCircledPass = null;
       }
-      processedLines.push(info.text);
+      processedLines.push(adjLevel !== info.level ? `${'#'.repeat(adjLevel)} ${hTitle}` : info.text);
       continue;
     }
 
@@ -2346,11 +2536,11 @@ function refineMarkdownByRules(rawText, options = {}) {
       }
       const canPromoteNumCandidate =
         !hasExistingH2 ||
-        (!hasStructuralH2 && !hasExplicitNumDotHeading && (hasOrderedSibling(i, 0) || hasDocHalfParenSub));
+        (!hasExplicitNumDotHeading && (hasOrderedSibling(i, 0) || hasDocHalfParenSub));
       if (allowPromote && info.kind === 'heading_num_candidate' && canPromoteNumCandidate) {
         const isOrphanLongNum1 = info.numVal === 1 && info.title.length > 20 && !hasOrderedSibling(i, 0);
         if (!isOrphanLongNum1) {
-          const hLine = pushHeadingRank(2, 2, `${info.num}. ${info.title}`);
+          const hLine = pushHeadingRank(2.5, 2, `${info.num}. ${info.title}`);
           if (activeCircledPass && headingStack.length > 0 && headingStack[headingStack.length - 1].level <= activeCircledPass.level) {
             activeCircledPass = null;
           }
@@ -2708,19 +2898,20 @@ function buildGlobalOutlinePlanPrompt(fullBody, headingScope = 'h1_h6', customNo
     bodyForPlan = `${fullBody.slice(0, third)}\n\n... [중간 일부 생략] ...\n\n${fullBody.slice(Math.floor(fullBody.length / 2) - Math.floor(third / 2), Math.floor(fullBody.length / 2) + Math.floor(third / 2))}\n\n... [후반 계속] ...\n\n${fullBody.slice(-third)}`;
   }
 
-  return `당신은 설교·성경연구 노트 전체 구조를 설계하는 편집장입니다.
-아래 노트 **전체 내용을 처음부터 끝까지 통독하며 신학적·논리적 흐름과 주제 포함 관계를 파악**한 뒤, 본문 전체에 일관되게 적용할 **전체 목차 계층 설계도(# ~ ######)** 만 작성하십시오.
+  const customPriority = customNote
+    ? `\n🚨 [최우선 사용자 직접 지시 — 아래 일반 설계 규칙보다 항상 우선하여 적용하십시오]\n${customNote}\n`
+    : '';
 
+  return `당신은 설교·성경연구 노트 전체 구조를 설계하는 편집장입니다.
+아래 노트 **전체 내용을 처음부터 끝까지 통독하며 신학적·논리적 흐름과 주제 포함 관계를 파악**한 뒤, 본문 전체에 일관되게 적용할 **전체 목차 계층 설계도(# ~ ######)** 만 작성하십시오.${customPriority}
 [설계 핵심 규칙]
 ${getHeadingGuideForAi(headingScope)}
-2. **동일 기호 = 동일 제목 등급(#) 절대 통일 (가장 중요)**:
-   - 문서 전체에서 **같은 기호(예: '■ ...', '● ...', '◆ ...', 'Ⅰ. ...')** 를 쓰는 형제 대지/중지는 문서 처음부터 끝까지 **반드시 똑같은 '#' 개수**를 부여하십시오.
-   - 원문에 한 곳만 '# ■ 파라오 왕의 말'처럼 '#'이 붙어 있고 다른 '■파라오가 사용한 방법', '■내가 행하리니'에는 '#'이 빠져 있어도, 모두 같은 '■' 기호이므로 전부 똑같은 '# ■ ...'(제목1)로 통일해야 합니다. 하나는 '#', 나머지는 '##'로 쪼개면 절대 안 됩니다!
-   - 같은 섹션 안의 같은 번호 체계('1., 2., 3., ... 6., 7.' 등)도 전부 같은 제목 등급이거나 전부 목록이어야 하며, '6.'만 '## 6.'이고 '1.~5., 7.'은 평문으로 남기는 불일치를 금지합니다.
-   - 본문 전체에 대단원(서론/본론) 없이 바로 '■ ...' 대지들로 이어진다면 그 대지 자체가 **'# '(제목1)** 부터 시작하십시오.
-   - 옵시디언 자동 번호('1. 본문 문장...')나 단순 열거 항목, 성경 구절 인용, 예화 스토리, 설명 문장은 **절대 제목으로 올리지 마십시오.**
+2. **제목1('# ')부터 시작 & 하위 제목까지 문서 전체 일관성 (가장 중요)**:
+   - 문서 전체 계층은 **반드시 제목1('# ')부터 시작**하십시오. 문서 전체를 제목2('## ') 몇 개로만 시작하고 그 아래 소제목('1. ...', '1) ...', '① ...')을 빠뜨리는 불완전한 설계를 금지합니다!
+   - 문서 전체에서 **같은 기호/체계('■ ...', '● ...', '1. ...', '1) ...')** 를 쓰는 형제 항목 중 제목 성격의 짧은 어구는 문서 처음부터 끝까지 빠짐없이 같은 '#' 등급으로 잡으십시오.
+   - 반대로, **긴 완전한 서술 문장형 번호('1. 창조주가 없다는 ... 주장이다.', '2. 율법을 ... 같다.')나 성경 구절 인용·단순 예화 문장**은 문맥상 본문/목록이지 제목이 아니므로 제목으로 올리지 말고 **명확한 제목 역할만** 계층에 넣으십시오.
 3. **출력 형식**:
-   - 인사말·설명·코드블록(\`\`\`) 없이, 문서 등장 순서대로 **'# ~ ######' 제목 줄만** 1줄에 하나씩 출력하십시오.${docProfile === 'general' ? '\n4. [일반 문서 양식]: 일반 원고·단행본이므로 서술 문단에 마인드맵용 \'- \'(대지 불릿)를 붙이지 말고 평문 문단으로 두십시오.' : ''}${customNote ? `\n${docProfile === 'general' ? '5' : '4'}. 사용자 추가 지시: ${customNote}` : ''}
+   - 인사말·설명·코드블록(\`\`\`) 없이, 문서 등장 순서대로 **'# ~ ######' 제목 줄만** 1줄에 하나씩 출력하십시오.${docProfile === 'general' ? '\n4. [일반 문서 양식]: 일반 원고·단행본이므로 서술 문단에 마인드맵용 \'- \'(대지 불릿)를 붙이지 말고 평문 문단으로 두십시오.' : ''}${customNote ? `\n${docProfile === 'general' ? '5' : '4'}. [다시 강조 — 사용자 추가 지시 최우선]: ${customNote}` : ''}
 
 [전체 노트 원문]
 ${bodyForPlan}`;
@@ -2731,22 +2922,27 @@ function buildAiPrompt(mode, chunkText, customNote, headingScope = 'h1_h6', auto
     ? `4. 옵시디언 자동 목록 기능 등으로 들여쓰기된 '1. / 2.' 숫자 목록은 문맥상 반드시 번호가 필요한 대지 제목이 아니면 모두 '- ' 일반 목록으로 바꾸고, 원본에 숫자가 없던 곳에 임의로 새 번호를 붙이지 마십시오.`
     : `4. 원본에 숫자가 없는 제목이나 목록에 임의로 '1.', '2.', '①' 등 새 번호를 매핑하지 마십시오. 반대로 옵시디언 자동 목록 완성 때문에 잘못 들어간 단독 '1.'이나 '- 1.' 중복 번호는 '- ' 일반 목록으로 복원하십시오.`;
 
-  const profileNote = docProfile === 'general'
+  const isGen = docProfile === 'general';
+  const customTop = customNote
+    ? `\n🚨 [최우선 사용자 추가 지시 — 아래 일반 규칙보다 항상 우선 적용! 절대 무시하지 마십시오]\n${customNote}\n`
+    : '';
+  const profileNote = isGen
     ? `\n\n[문서 양식: 📄 일반 문서 (목사님 원고 · 단행본 · 강의안)]
 - 이 문서는 개인 설교 마인드맵이 아닌 **일반 원고/단행본**입니다.
-- **절대 문단 앞에 마인드맵용 0단계 '- '(V 대지 기호)를 새로 붙이지 마십시오.** (원본에 쓸데없이 붙은 '- ' 서술 문장은 일반 평문 단락으로 푸십시오.)
-- 본문 설명·예화·인용은 자연스러운 일반 평문 단락으로 유지하고, 과도하게 끊긴 줄바꿈·빈 줄을 매끄럽게 정돈하며, 명확한 개요(Ⅰ., 1., (1), ①, 가. 등)의 **제목(#~######) 계층과 원본 강조 서식(굵게·밑줄·형광펜·표)** 만 깔끔하게 살리십시오.`
+- **절대 문단 앞에 마인드맵용 '- '(대지 기호)나 '\\t- ' 탭 목록을 새로 붙이지 마십시오.** (원본 서술 문장에 붙은 '- ', '✓ '는 일반 평문 단락으로 푸십시오.)
+- 본문 설명·예화·인용은 문맥에 맞는 자연스러운 일반 평문 단락으로 두고, **제목(#~######)과 제목 아래 붙어 나온 설명 문장·한 줄에 연달아 붙은 '5. ... 6. ...' 번호 항목은 반드시 줄바꿈으로 분리**하십시오.
+- 계층은 **제목1('# ')부터** 문맥상 제목인 것만 전체 문서에 일관되게 잡고, 긴 서술 문장형 '1. ~다., 2. ~다.'는 제목으로 올리지 말고 일반 번호 문단으로 유지하십시오.`
     : '';
 
   const commonRules = `당신은 목회자/신학자의 옵시디언 설교·성경연구 노트 편집 도우미입니다.
-아래 원문 텍스트를 손실 없이 다듬어 마크다운으로만 출력하십시오.
+아래 원문 텍스트를 손실 없이 다듬어 마크다운으로만 출력하십시오.${customTop}
 
 [절대 보존 규칙]
 1. 내용을 요약하거나 삭제·축약·창작하지 마십시오. 원문의 모든 논지, 예화, 구절, 신학 용어를 빠짐없이 유지하십시오.
 2. 기존에 들어있는 옵시디언 마크업(==강조==, %%shade:...%%, [대괄호 강조], [[내부링크]], <font ...>, <u>...</u>)은 절대 훼손하지 마십시오.
 3. 성경 구절 인용(개역한글 등), 한자(漢字), 헬라어(악센트·숨표 포함), 히브리어(니쿠드 포함), 영어 인용은 원형 그대로 보존하십시오.
 ${autoNumNote}
-5. 인사말이나 코드블록(\`\`\`) 없이 정리된 마크다운 본문만 출력하십시오.${customNote ? `\n6. 사용자 추가 요청: ${customNote}` : ''}`;
+5. 인사말이나 코드블록(\`\`\`) 없이 정리된 마크다운 본문만 출력하십시오.${customNote ? `\n6. [최우선 재확인] 사용자 추가 지시: ${customNote}` : ''}`;
 
   const headingGuide = getHeadingGuideForAi(headingScope);
 
@@ -2758,21 +2954,21 @@ ${autoNumNote}
     : '';
 
   const modeLead = mode === 'ai_struct'
-    ? `[이번 작업: 전체 편집 (전체 문맥 기반 AI 맞춤법·오타 교정 + 대지 #~###### 하이어라키 구조화)]
+    ? `[이번 작업: 전체 편집 (전체 문맥 기반 AI 맞춤법·오타 교정 + 제목1('# ')부터 일관된 하이어라키 구조화)]
 - 먼저 내용 전체의 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악하고, 붙은 띄어쓰기('대한정확한이해를하고' → '대한 정확한 이해를 하고')·복붙 오타('말음'→'마음', '받향'→'방향')·HTML 잔재(&#8228;→·)·끊긴 줄바꿈과 문단을 깔끔히 교정·구조화하십시오:`
     : `[이번 작업: AI 맞춤법, 구조화 정리]
-- 전체 내용의 논리 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악해 계층을 잡으면서, 붙은 띄어쓰기·복붙 오타·끊긴 줄바꿈과 문단을 교정·구조화하십시오:`;
+- 전체 내용의 논리 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악해 제목1('# ')부터 일관되게 계층을 잡으면서, 붙은 띄어쓰기·복붙 오타·끊긴 줄바꿈과 문단을 교정·구조화하십시오:`;
 
-  return `${commonRules}${profileNote}
-${globalPlanBlock}${prevContextBlock}
-${modeLead}
-${headingGuide}
-  2. **끊긴 줄바꿈·어색한 빈 줄(\\n\\n) 연결 및 밑줄 변환 (매우 중요)**:
-     - PDF·HWP·DOCX 변환 때문에 **한 문장이나 한 성경 본문 인용, \`<u>...</u>\` / \`[...]{.underline}\` / \`*\*...**\`, 부사·관형어·연결어미 중간이 줄바꿈이나 빈 줄(\\n\\n)로 토막나 있으면** (예: \`(잠 1:10-19) (10) ... (11) 그들이\\n\\n네게 말하기를 ...\`, \`시간을 소중히\\n\\n여길 수 있다.\`, \`그리스도 앞에서 서야\\n\\n한다.\`, \`...보면 그\\n\\n시간이 ...\`, \`*\*... 제 삼\\n\\n일에 살아나야...\*\*\`), **원본의 어색한 줄바꿈과 빈 줄을 그대로 두지 말고 문장·구절이 끝날 때까지 띄어쓰기 1칸으로 자연스럽게 한 문장·한 인용 문단으로 이어 붙이십시오.**
-     - Pandoc 밑줄(\`[텍스트]{.underline}\`)은 반드시 옵시디언 HTML 밑줄 태그인 \`<u>텍스트</u>\` 형태로 유지·변환하고, \`{.underline}\` 문법을 그대로 남기지 마십시오.
-  3. **번호·대지 기호 중복, \`-.\` 기호 및 공백 누락 방지 (매우 중요)**:
+  const outlineAndIndentRules = isGen
+    ? `  3. **제목·번호 분리 및 문단 줄바꿈 정리 (매우 중요)**:
+     - **제목/소제목 뒤에 설명 문장이나 성구 인용이 바로 한 줄에 붙어 있으면** (예: \`**3) ... 드러냄** 하나님 불의하다?\`, \`**1. 성령을 받을 때...** "기록된바..."\`) **반드시 줄바꿈으로 제목과 아래 본문을 분리**하십시오.
+     - **한 줄 안에 다음 번호가 이어붙은 경우** (예: \`**5. ... 같다.** **6. 교회를...**\`, \`...연약함 **3. 하나님이...**\`) 반드시 각 번호마다 새 문단으로 나누십시오.
+     - 문맥상 **제목 역할인 짧은 '1. / 1) / ①'** 은 문서 전체에서 빠뜨리지 말고 일관된 '#' 등급으로 올리고, **긴 서술 문장형 '1. ~다., 2. ~다.'는 제목으로 올리지 말고 일반 번호 문단으로** 두십시오.
+  4. 성경 구절: '(창 47:7-10) 말씀...' 형태로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`
+    : `  3. **번호·대지 기호 중복, \`-.\` 기호 및 공백 누락 방지 (매우 중요)**:
      - '1) 제목', '2) 제목', '1. 제목', '2. 제목' 앞에 **절대 '- '를 붙이지 마십시오** ('- 1) ...' ❌ → '1) ...' 또는 '\\t1) ...' ⭕, 제목이면 '## 1) ...'). '- 1)'로 쓰면 뷰어에서 '✓ 1)'처럼 대지 기호와 번호가 겹쳐 나옵니다.
      - 반대로 사용자가 직접 지정한 \`✓ 1. ...\`, \`✓ 1) ...\`(숫자 대지 기호) 줄은 '✓ '를 지우거나 제목(#)으로 바꾸지 말고 원형 그대로 유지하십시오.
+     - **제목과 아래 문장이 한 줄에 붙어 있거나 한 줄 중간에 다음 번호(\`5. ... 6. ...\`)가 붙어 있으면 반드시 줄바꿈으로 분리**하십시오.
      - \`-. 텍스트\` 형태의 한글 문서 목록은 일반 \`- 텍스트\` 목록으로 정규화하고, 한 줄 중간에 \` -. \`로 이어붙은 항목(\`...지냈다 -. 초기 40년간은...\`)은 반드시 새 줄 \`- \`로 분리하십시오.
      - '■제목', '1.성경', '1)파라오'처럼 기호·번호 뒤 공백이 빠진 경우 반드시 공백 1칸('■ 제목', '1. 성경', '1) 파라오')을 넣으십시오.
   4. **하위 내용 들여쓰기 종속 규칙 (매우 중요)**:
@@ -2783,7 +2979,17 @@ ${headingGuide}
      - 문서 상단에서 \`(1) ...\`, \`(2) ...\`, \`(3) ...\`이나 \`A. ...\`, \`B. ...\`, \`a. ...\`이 각각 \`###\`, \`####\`, \`#####\` 제목으로 올라갔다면, 문서 하단 다른 대지(\`## 2.\`) 아래에 \`- (1) ...\`, \`- (2) ...\`처럼 불릿이 잘못 붙어 있더라도 절대 본문 목록으로 두지 말고 똑같이 \`### (1) ...\`, \`### (2) ...\` 제목으로 통일하십시오.
      - **원문자(①, ②, ③...) 제목 승격**: \`①, ②, ③...\` 원문자 숫자는 본문이나 일반 목록(\`- ①\`)으로 두지 말고, 바로 위에 있는 상위 제목(\`#\`, \`##\`, \`###\` 등)을 찾아 반드시 그 한 단계 아래 제목(\`## ①\`, \`### ①\`, \`#### ①\` 등)으로 승격시키십시오.
      - 상위 번호(예: ⑪)가 목록인데 하위 항목(가., 나.)만 제목(####)으로 뒤집히지 않게 일관성을 유지하십시오.
-  6. 성경 구절: '(창 47:7-10) 말씀...' 형태(목록 내부라면 '\\t- (창 26:1) 말씀...')로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.
+  6. 성경 구절: '(창 47:7-10) 말씀...' 형태(목록 내부라면 '\\t- (창 26:1) 말씀...')로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`;
+
+  return `${commonRules}${profileNote}
+${globalPlanBlock}${prevContextBlock}
+${modeLead}
+${headingGuide}
+  2. **끊긴 줄바꿈·어색한 빈 줄(\\n\\n) 연결 및 밑줄 변환 (매우 중요)**:
+     - PDF·HWP·DOCX 변환 때문에 **한 문장이나 한 성경 본문 인용, \`<u>...</u>\` / \`[...]{.underline}\` / \`*\*...**\`, 부사·관형어·연결어미 중간이 줄바꿈이나 빈 줄(\\n\\n)로 토막나 있으면** (예: \`(잠 1:10-19) (10) ... (11) 그들이\\n\\n네게 말하기를 ...\`, \`시간을 소중히\\n\\n여길 수 있다.\`, \`그리스도 앞에서 서야\\n\\n한다.\`, \`...보면 그\\n\\n시간이 ...\`, \`*\*... 제 삼\\n\\n일에 살아나야...\*\*\`), **원본의 어색한 줄바꿈과 빈 줄을 그대로 두지 말고 문장·구절이 끝날 때까지 띄어쓰기 1칸으로 자연스럽게 한 문장·한 인용 문단으로 이어 붙이십시오.**
+     - Pandoc 밑줄(\`[텍스트]{.underline}\`)은 반드시 옵시디언 HTML 밑줄 태그인 \`<u>텍스트</u>\` 형태로 유지·변환하고, \`{.underline}\` 문법을 그대로 남기지 마십시오.
+${outlineAndIndentRules}
+${customNote ? `\n🚨 [최종 확인 — 사용자 추가 지시 최우선 적용]: ${customNote}` : ''}
 
 [현재 편집할 구간]
 ${chunkText}`;
@@ -3399,7 +3605,11 @@ class SermonMdRefinerPlugin extends Plugin {
       }
     }
     if (effectiveRuleOpts.mergeBrokenLines !== false) {
-      cleanBody = mergeBrokenLinesPass(cleanBody.split('\n').map((l) => l.replace(/[ \t]+$/g, '')), effectiveRuleOpts.vaultBasePath || '').join('\n');
+      let prepLines = splitInlineNumberedItemsPass(
+        cleanBody.split('\n').map((l) => l.replace(/[ \t]+$/g, '')),
+        effectiveDocProfile === 'general'
+      );
+      cleanBody = mergeBrokenLinesPass(prepLines, effectiveRuleOpts.vaultBasePath || '').join('\n');
     }
     cleanBody = convertPandocUnderlineTags(cleanBody);
 
@@ -3450,6 +3660,7 @@ class SermonMdRefinerPlugin extends Plugin {
       outChunks.push(refined);
     }
 
+    const hasCustomNote = Boolean(customNote && customNote.trim());
     let assembled = outChunks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
     if (assembled) {
       if (!effectiveStripQuotes) {
@@ -3463,6 +3674,7 @@ class SermonMdRefinerPlugin extends Plugin {
         const postBody = refineMarkdownByRules(assembled, Object.assign({}, effectiveRuleOpts, {
           addMissingFrontmatter: false,
           preserveExistingHeadings: true,
+          respectAiHeadings: hasCustomNote,
           useSelectionOnly: true
         }));
         assembled = postBody.trim();
@@ -3480,6 +3692,7 @@ class SermonMdRefinerPlugin extends Plugin {
         postLines = reconcileDocumentStructure(postLines, {
           docProfile: effectiveDocProfile,
           normalizeHierarchy: effectiveRuleOpts.normalizeHierarchy !== false,
+          respectAiHeadings: hasCustomNote,
           spacesToTabs: effectiveRuleOpts.spacesToTabs !== false,
           headingLevelScope: effectiveScope,
           autoNumberedStyle: effectiveNumStyle
