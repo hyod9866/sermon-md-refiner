@@ -421,7 +421,14 @@ function lines_pushSplitInlineNums(line, out) {
       out.push(`${leadWs}${titleHead}`);
       out.push(`${leadWs}${boldTopicGlue[3]}`);
     } else {
-      out.push(part);
+      // Normalize mixed bold-wrapped "**2. 문장...** 후속" -> "2. **문장...** 후속" so Markdown/Obsidian never renumbers partial lists
+      const mixedBoldNum = pTrim.match(/^\*\*(\d{1,3})\.\s+([^*]+?)\*\*(\.?)(\s+.+)?$/);
+      if (mixedBoldNum && (mixedBoldNum[3] || mixedBoldNum[4] || mixedBoldNum[2].length > 42 || /(?:다|요|죠|까|네|라)$/.test(mixedBoldNum[2].trim()))) {
+        const tail = `${mixedBoldNum[3] || ''}${mixedBoldNum[4] || ''}`;
+        out.push(`${leadWs}${mixedBoldNum[1]}. **${mixedBoldNum[2].trim()}**${tail}`);
+      } else {
+        out.push(part);
+      }
     }
   }
 }
@@ -563,14 +570,15 @@ function classifyOutlineLine(line) {
   if (numLine) {
     const numVal = parseInt(numLine[1], 10);
     const bodyText = numLine[2];
-    const isShortNounNominal = bodyText.length <= 28 && !/[.?!,]/.test(bodyText) && !/(?:다|요|죠|까|네|라)$/.test(bodyText);
+    const plainBody = bodyText.replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
+    const isShortNounNominal = plainBody.length <= 28 && !/[.?!,]/.test(plainBody) && !/(?:다|요|죠|까|네|라)$/.test(plainBody);
     const looksLikeHeading =
       indent === 0 &&
       numVal >= 1 &&
       numVal <= 15 &&
-      bodyText.length <= 42 &&
-      (!/[.?!다요죠함음]$/.test(bodyText) || isShortNounNominal) &&
-      !/%%|\*\*\*|^[([]/.test(bodyText);
+      plainBody.length <= 42 &&
+      (!/[.?!다요죠함음]$/.test(plainBody) || isShortNounNominal) &&
+      !/%%|\*\*\*|^[([]/.test(plainBody);
     if (looksLikeHeading) {
       return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: numLine[1], numVal, title: bodyText, body: bodyText, text: trimmed };
     }
@@ -1100,6 +1108,7 @@ function isSentenceOrColonProse(body) {
   const b = String(body || '').trim();
   const stripped = b
     .replace(/^(?:[①-⑳]|\d{1,2}[.)]|\(\d{1,2}\)|[가-하]\.|\([가-하]\)|[a-zA-Z][.)])\s*/, '')
+    .replace(/\*\*|__|~~|<\/?u>/gi, '')
     .trim();
   if (stripped.length > 56) return true;
   if (/[.?!다요죠]$/.test(stripped)) return true;
@@ -1112,6 +1121,7 @@ function isOutlineQuestionHeading(body) {
   const stripped = String(body || '')
     .trim()
     .replace(/^(?:[①-⑳]|\d{1,2}[.)]|\(\d{1,2}\)|[가-하]\.|\([가-하]\)|[a-zA-Z][.)])\s*/, '')
+    .replace(/\*\*|__|~~|<\/?u>/gi, '')
     .trim();
   return /\?$/.test(stripped) && stripped.length > 0 && stripped.length <= 32 && !/[.!]/.test(stripped);
 }
@@ -1120,6 +1130,7 @@ function isConciseStatementHeading(body) {
   const stripped = String(body || '')
     .trim()
     .replace(/^(?:\d{1,2}[.)]|\(\d{1,2}\))\s*/, '')
+    .replace(/\*\*|__|~~|<\/?u>/gi, '')
     .trim();
   if (!stripped || stripped.length > 42 || /[?!]/.test(stripped)) return false;
   if ((stripped.match(/,/g) || []).length >= 2) return false;
@@ -1686,6 +1697,22 @@ function reconcileDocumentStructure(lines, opts) {
             !(p.tag.text.length > 44 && /,/.test(p.tag.text));
           return (fitsNumericHeading || fitsNonNumericHeading) && !/^>/.test(p.body);
         });
+        // If an entire numeric section (>= 4 headings, e.g. 1.~9. "~알아야 한다.") is exclusively full declarative sentences with zero child subheadings, demote back to numbered points.
+        if (fam === 'num_dot' && bh.length >= 4 && pBucket.unpromoted.length === 0 && bh.every((h) => isSentenceOrColonProse(h.body) && /[다][.?!]?$/.test(h.body.replace(/\*\*|__|~~|<\/?u>/gi, '').trim()))) {
+          const hasChildHeadingUnderRun = bh.some((h) => {
+            for (let k = h.idx + 1; k < parsed.length; k++) {
+              if (parsed[k].kind === 'heading') return parsed[k].level > h.level;
+            }
+            return false;
+          });
+          if (!hasChildHeadingUnderRun) {
+            for (const h of bh) {
+              out[h.idx] = h.body;
+              changedAny = true;
+            }
+            continue;
+          }
+        }
         // Preserve an already-uniform section if it has zero unpromoted heading-like siblings
         const levelsHere = new Set(bh.map((h) => h.level));
         if (bh.length > 0 && levelsHere.size === 1 && bh[0].level > parLevel && candidateUnpromoted.length === 0) {
@@ -1694,6 +1721,11 @@ function reconcileDocumentStructure(lines, opts) {
         // If this section has zero existing headings for this family and any unpromoted item in it is a long prose item (e.g. 1.~11. prose + short 12.~13.), don't cherry-pick 12.~13.
         if (bh.length === 0 && pBucket.unpromoted.length > candidateUnpromoted.length && isNumericFam) {
           continue;
+        }
+        // If section has zero pre-existing headings and all items in this numbered run are full declarative sentences (~다.), keep as numbered points rather than headings
+        if (bh.length === 0 && isNumericFam && pBucket.unpromoted.length >= 2) {
+          const allProseSentences = pBucket.unpromoted.every((uIdx) => isSentenceOrColonProse(parsed[uIdx].tag.text));
+          if (allProseSentences) continue;
         }
         const localTarget = bh.length > 0
           ? Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...bh.map((h) => h.level))))
@@ -2268,12 +2300,38 @@ function reconcileDocumentStructure(lines, opts) {
     }
   }
 
-  // Pass 6: In general docs, AI-preserved headings, or orphaned H2 major symbols (## ■ / ## ● / ## Ⅰ.),
-  // normalize heading hierarchy to start at H1 ('# ') and compress any skipped levels cleanly.
+  // Pass 6: Option B — If doc has 1 lone plain document title (# Title) at top above >=2 ## ■/major sections,
+  // demote that top title to bold text and shift all ## ■ -> # ■, ### -> ##, #### -> ### cleanly!
+  out = demoteLoneDocTitleIfMajorH2(out, isGeneralDoc);
   const hasH2MajorOnly = !out.some((l) => /^#\s+/.test(l.trim())) && out.some((l) => /^##\s+(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(l.trim()));
   const shouldShiftToH1 = isGeneralDoc || !!opts.preserveExistingHeadings || hasH2MajorOnly;
   out = normalizeMinHeadingLevelPass(out, shouldShiftToH1);
 
+  return out;
+}
+
+function demoteLoneDocTitleIfMajorH2(lines, isGeneralDoc = false) {
+  const out = lines.slice();
+  let inFence = false;
+  const h1s = [];
+  const h2s = [];
+  for (let i = 0; i < out.length; i++) {
+    if (/^\s*(?:```|~~~)/.test(out[i])) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    const m = out[i].match(/^(#{1,6})\s+(.+)$/);
+    if (!m) continue;
+    if (m[1].length === 1) h1s.push({ idx: i, text: m[2].trim() });
+    else if (m[1].length === 2) h2s.push({ idx: i, text: m[2].trim() });
+  }
+  if (h1s.length === 1 && h2s.length >= 2 && h1s[0].idx < h2s[0].idx) {
+    const title = h1s[0].text;
+    const isPlainDocTitle = !/^(?:[■●◆▲▶★◎◩]|\d{1,3}[.)]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(title);
+    const hasMajorH2Symbols = h2s.some((h) => /^(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(h.text));
+    if (isPlainDocTitle && (hasMajorH2Symbols || isGeneralDoc)) {
+      const clean = title.replace(/^\*\*(.+)\*\*$/, '$1');
+      out[h1s[0].idx] = `**${clean}**`;
+    }
+  }
   return out;
 }
 
@@ -2498,6 +2556,41 @@ function refineMarkdownByRules(rawText, options = {}) {
       const isHalfParenH = /^\d{1,2}\)\s/.test(hTitle);
       const isFullParenH = /^\(\d{1,2}\)\s/.test(hTitle);
       const isCircledH = /^[①-⑳]\s/.test(hTitle);
+      // Demote mistakenly pre-promoted intro preview summaries ("몇가지를 생각해 보자.\n### 1) ...\n### 2) ...\n## ■ ...")
+      if (isHalfParenH && info.level >= 2) {
+        let sIdx = i;
+        while (sIdx - 1 >= startIdx) {
+          const pk = parsedLines[sIdx - 1];
+          if (pk.kind === 'blank') { sIdx--; continue; }
+          if (pk.kind === 'heading' && /^\d{1,2}\)\s/.test(pk.text.replace(/^#{1,6}\s+/, ''))) { sIdx--; continue; }
+          break;
+        }
+        while (sIdx < i && parsedLines[sIdx].kind === 'blank') sIdx++;
+        let eIdx = i;
+        while (eIdx + 1 < parsedLines.length) {
+          const nk = parsedLines[eIdx + 1];
+          if (nk.kind === 'blank') { eIdx++; continue; }
+          if (nk.kind === 'heading' && /^\d{1,2}\)\s/.test(nk.text.replace(/^#{1,6}\s+/, ''))) { eIdx++; continue; }
+          break;
+        }
+        while (eIdx > i && parsedLines[eIdx].kind === 'blank') eIdx--;
+        let cnt = 0; let cleanOnly = true;
+        for (let k = sIdx; k <= eIdx; k++) {
+          if (parsedLines[k].kind === 'heading') cnt++;
+          else if (parsedLines[k].kind !== 'blank') { cleanOnly = false; break; }
+        }
+        let prevNb = sIdx - 1;
+        while (prevNb >= startIdx && parsedLines[prevNb].kind === 'blank') prevNb--;
+        let nextNb = eIdx + 1;
+        while (nextNb < parsedLines.length && parsedLines[nextNb].kind === 'blank') nextNb++;
+        const pLead = prevNb >= startIdx && isIntroLeadLine(rawLines[prevNb] || '');
+        const np = nextNb < parsedLines.length ? parsedLines[nextNb] : null;
+        const nMaj = np && (np.kind === 'heading_sym' || np.kind === 'heading_roman' || (np.kind === 'heading' && /#\s+(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(np.text || '')));
+        if (cleanOnly && cnt >= 2 && pLead && nMaj) {
+          processedLines.push(hTitle);
+          continue;
+        }
+      }
       const effRank = hasSymInH
         ? Math.min(info.level, 1.5)
         : (isHalfParenH ? 3 : (isFullParenH ? 3.5 : (isCircledH ? 4.5 : info.level)));
@@ -2580,10 +2673,58 @@ function refineMarkdownByRules(rawText, options = {}) {
           continue;
         }
 
+        const isIntroPreviewSummaryAt = () => {
+          if (!isHalfParenMarker) return false;
+          // Look backward for contiguous 1), 2)... block without intervening prose
+          let startRun = i;
+          while (startRun - 1 >= startIdx) {
+            const pr = parsedLines[startRun - 1];
+            if (pr.kind === 'blank') { startRun--; continue; }
+            if (pr.kind === 'outline_sub' && /^\d{1,2}\)$/.test(pr.marker || '') && pr.indent === 0) {
+              startRun--;
+              continue;
+            }
+            break;
+          }
+          // Trim leading blank lines from startRun
+          while (startRun < i && parsedLines[startRun].kind === 'blank') startRun++;
+          let endRun = i;
+          while (endRun + 1 < parsedLines.length) {
+            const nx = parsedLines[endRun + 1];
+            if (nx.kind === 'blank') { endRun++; continue; }
+            if (nx.kind === 'outline_sub' && /^\d{1,2}\)$/.test(nx.marker || '') && nx.indent === 0) {
+              endRun++;
+              continue;
+            }
+            break;
+          }
+          while (endRun > i && parsedLines[endRun].kind === 'blank') endRun--;
+          let countItems = 0;
+          for (let k = startRun; k <= endRun; k++) {
+            if (parsedLines[k].kind === 'outline_sub') countItems++;
+            else if (parsedLines[k].kind !== 'blank') return false;
+          }
+          if (countItems < 2) return false;
+          // Check immediately before startRun for intro lead OR immediately after endRun for major ■/● heading
+          let prevNonBlank = startRun - 1;
+          while (prevNonBlank >= startIdx && parsedLines[prevNonBlank].kind === 'blank') prevNonBlank--;
+          const hasLead = prevNonBlank >= startIdx && isIntroLeadLine(rawLines[prevNonBlank] || '');
+          let nextNonBlank = endRun + 1;
+          while (nextNonBlank < parsedLines.length && parsedLines[nextNonBlank].kind === 'blank') nextNonBlank++;
+          const np = nextNonBlank < parsedLines.length ? parsedLines[nextNonBlank] : null;
+          const followedByMajorH = np && (
+            np.kind === 'heading_sym' ||
+            np.kind === 'heading_roman' ||
+            (np.kind === 'heading' && np.level <= 2 && /[#]\s+(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(np.text || ''))
+          );
+          return !!(hasLead && followedByMajorH);
+        };
+
         const shouldPromoteToHeading =
           allowPromote &&
           allowFromBullet &&
           effCanBeHeading &&
+          !isIntroPreviewSummaryAt() &&
           !isContiguousProseListAt(parsedLines, i, null) &&
           (isCircledSub ? maxHeadingLevel >= 2 : maxHeadingLevel >= 3) &&
           !inActiveSiblingList &&
@@ -2907,7 +3048,7 @@ function buildGlobalOutlinePlanPrompt(fullBody, headingScope = 'h1_h6', customNo
 [설계 핵심 규칙]
 ${getHeadingGuideForAi(headingScope)}
 2. **제목1('# ')부터 시작 & 하위 제목까지 문서 전체 일관성 (가장 중요)**:
-   - 문서 전체 계층은 **반드시 제목1('# ')부터 시작**하십시오. 문서 전체를 제목2('## ') 몇 개로만 시작하고 그 아래 소제목('1. ...', '1) ...', '① ...')을 빠뜨리는 불완전한 설계를 금지합니다!
+   - 문서 맨 첫 줄의 전체 파일 제목(예: '# 성경의 선용과 악용')은 '# ' 제목1에 두지 말고 일반 굵은 제목('**성경의 선용과 악용**')으로 내려 둔 뒤, 본문의 큰 대단원('■ ...', '● ...', 'Ⅰ. ...')부터 **반드시 '# '(제목1)** → 중지 '## ' → 소지 '### ' 순서로 시작하십시오. 문서 전체를 제목2('## ') 몇 개로만 시작하고 그 아래 소제목('1. ...', '1) ...', '① ...')을 빠뜨리는 불완전한 설계를 금지합니다!
    - 문서 전체에서 **같은 기호/체계('■ ...', '● ...', '1. ...', '1) ...')** 를 쓰는 형제 항목 중 제목 성격의 짧은 어구는 문서 처음부터 끝까지 빠짐없이 같은 '#' 등급으로 잡으십시오.
    - 반대로, **긴 완전한 서술 문장형 번호('1. 창조주가 없다는 ... 주장이다.', '2. 율법을 ... 같다.')나 성경 구절 인용·단순 예화 문장**은 문맥상 본문/목록이지 제목이 아니므로 제목으로 올리지 말고 **명확한 제목 역할만** 계층에 넣으십시오.
 3. **출력 형식**:
@@ -2931,7 +3072,7 @@ function buildAiPrompt(mode, chunkText, customNote, headingScope = 'h1_h6', auto
 - 이 문서는 개인 설교 마인드맵이 아닌 **일반 원고/단행본**입니다.
 - **절대 문단 앞에 마인드맵용 '- '(대지 기호)나 '\\t- ' 탭 목록을 새로 붙이지 마십시오.** (원본 서술 문장에 붙은 '- ', '✓ '는 일반 평문 단락으로 푸십시오.)
 - 본문 설명·예화·인용은 문맥에 맞는 자연스러운 일반 평문 단락으로 두고, **제목(#~######)과 제목 아래 붙어 나온 설명 문장·한 줄에 연달아 붙은 '5. ... 6. ...' 번호 항목은 반드시 줄바꿈으로 분리**하십시오.
-- 계층은 **제목1('# ')부터** 문맥상 제목인 것만 전체 문서에 일관되게 잡고, 긴 서술 문장형 '1. ~다., 2. ~다.'는 제목으로 올리지 말고 일반 번호 문단으로 유지하십시오.`
+- 맨 위 문서 전체 제목 1줄('# 성경의 선용과 악용' 등)은 '**...**' 굵은 제목으로 내리고, 본문의 큰 대지('■ ...', '● ...')부터 **제목1('# ')부터** 일관되게 계층을 잡으며, 긴 서술 문장형 '1. ~다., 2. ~다.'나 서론 요약 '1)~3)'은 제목으로 올리지 말고 일반 번호 문단으로 유지하십시오.`
     : '';
 
   const commonRules = `당신은 목회자/신학자의 옵시디언 설교·성경연구 노트 편집 도우미입니다.
