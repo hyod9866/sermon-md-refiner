@@ -278,6 +278,14 @@ function isCircledHeadingBody(body) {
   return true;
 }
 
+function isNumericOutlineHeadingBody(body) {
+  const b = String(body || '').replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
+  if (!b || b.length > 180) return false;
+  if (/%%|\*\*\*|^[([]/.test(b)) return false;
+  if (/^\([가-힣]+\s*\d+:\d+/.test(b)) return false;
+  return true;
+}
+
 function unescapePandocMarkdown(text) {
   const lines = String(text || '').split('\n');
   let fence = false;
@@ -553,7 +561,7 @@ function classifyOutlineLine(line) {
         kind: 'outline_sub',
         rank: 3,
         headingRank: 3,
-        canBeHeading: isShortSubheadingBody(wrappedHalf[2], true),
+        canBeHeading: indent === 0 ? isNumericOutlineHeadingBody(wrappedHalf[2]) : isShortSubheadingBody(wrappedHalf[2], true),
         indent,
         leading,
         marker: wrappedHalf[1],
@@ -609,19 +617,11 @@ function classifyOutlineLine(line) {
   if (boldNumLine) {
     const numVal = parseInt(boldNumLine[1], 10);
     const bodyText = boldNumLine[2].trim();
-    const endsWithPeriodOrSentence = Boolean(boldNumLine[3]) || /[.?!]$/.test(bodyText) || /(?:다|요|죠|까|네|라|니다)$/.test(bodyText);
-    const isShortNounNominal = bodyText.length <= 28 && !boldNumLine[3] && !/[.?!,]/.test(bodyText) && !/(?:다|요|죠|까|네|라)$/.test(bodyText);
-    const looksLikeHeading =
-      indent === 0 &&
-      numVal >= 1 &&
-      numVal <= 15 &&
-      bodyText.length <= 42 &&
-      (!endsWithPeriodOrSentence || isShortNounNominal) &&
-      !/%%|\*\*\*|^[([]/.test(bodyText);
-    if (looksLikeHeading) {
-      return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: boldNumLine[1], numVal, title: bodyText, body: bodyText, text: `${boldNumLine[1]}. ${bodyText}` };
+    const bodyOut = `**${bodyText}**${boldNumLine[3] || ''}`;
+    if (indent === 0 && numVal >= 1 && numVal <= 30 && isNumericOutlineHeadingBody(bodyText)) {
+      return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: boldNumLine[1], numVal, title: bodyOut, body: bodyOut, text: `${boldNumLine[1]}. ${bodyOut}` };
     }
-    return { kind: 'ordered_list', indent, leading, num: boldNumLine[1], numVal, body: `**${bodyText}**${boldNumLine[3] || ''}`, text: trimmed };
+    return { kind: 'ordered_list', indent, leading, num: boldNumLine[1], numVal, body: bodyOut, text: trimmed };
   }
 
   const boldHalfParen = trimmed.match(/^\*\*(\d{1,2}\))\s*(.+?)\*\*(\.?)$/);
@@ -631,7 +631,7 @@ function classifyOutlineLine(line) {
       kind: 'outline_sub',
       rank: 3,
       headingRank: 3,
-      canBeHeading: isShortSubheadingBody(bodyText, true),
+      canBeHeading: indent === 0 ? isNumericOutlineHeadingBody(bodyText) : isShortSubheadingBody(bodyText, true),
       indent,
       leading,
       marker: boldHalfParen[1],
@@ -640,34 +640,25 @@ function classifyOutlineLine(line) {
     };
   }
 
-  // Numbered line: "1. 본문" (col 0 heading candidate) vs ordered list item ("\t1. ...", long prose, or >15)
+  // Numbered line: "1. 본문" (col 0 heading candidate) vs ordered list item ("\t1. ..." or >30 year)
   const numLine = trimmed.match(/^(\d{1,4})\.\s+(.+)$/);
   if (numLine) {
     const numVal = parseInt(numLine[1], 10);
     const bodyText = numLine[2];
-    const plainBody = bodyText.replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
-    const isShortNounNominal = plainBody.length <= 28 && !/[.?!,]/.test(plainBody) && !/(?:다|요|죠|까|네|라)$/.test(plainBody);
-    const looksLikeHeading =
-      indent === 0 &&
-      numVal >= 1 &&
-      numVal <= 15 &&
-      plainBody.length <= 42 &&
-      (!/[.?!다요죠함음]$/.test(plainBody) || isShortNounNominal) &&
-      !/%%|\*\*\*|^[([]/.test(plainBody);
-    if (looksLikeHeading) {
+    if (indent === 0 && numVal >= 1 && numVal <= 30 && isNumericOutlineHeadingBody(bodyText)) {
       return { kind: 'heading_num_candidate', rank: 2, indent, leading, num: numLine[1], numVal, title: bodyText, body: bodyText, text: trimmed };
     }
     return { kind: 'ordered_list', indent, leading, num: numLine[1], numVal, body: bodyText, text: trimmed };
   }
 
-  // Half-paren numbers "1) 제목" -> Rank 3 heading candidate if short title, else list item
+  // Half-paren numbers "1) 제목" -> Rank 3 heading candidate
   const halfParenNum = trimmed.match(/^(\d{1,2}\))\s+(.+)$/);
   if (halfParenNum) {
     return {
       kind: 'outline_sub',
       rank: 3,
       headingRank: 3,
-      canBeHeading: isShortSubheadingBody(halfParenNum[2], true),
+      canBeHeading: indent === 0 ? isNumericOutlineHeadingBody(halfParenNum[2]) : isShortSubheadingBody(halfParenNum[2], true),
       indent,
       leading,
       marker: halfParenNum[1],
@@ -1460,6 +1451,35 @@ function mergeBrokenLinesPass(lines, vaultBasePath = '') {
   return out;
 }
 
+function padGeneralStandaloneBibleVerses(lines) {
+  const standaloneVerseRe = new RegExp(
+    `^[ \\t]*(?:>\\s*)?(?:\\*\\*|__)?[\\[(]\\s*(?:${BOOK_PATTERN})\\s*\\d{1,3}\\s*[:：]\\s*\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?\\s*[\\])](?:\\*\\*|__)?\\s+\\S`
+  );
+  const out = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (!inFence && standaloneVerseRe.test(line)) {
+      if (out.length > 0 && out[out.length - 1].trim() !== '') {
+        out.push('');
+      }
+      out.push(line);
+      const next = i + 1 < lines.length ? lines[i + 1] : null;
+      if (next !== null && next.trim() !== '') {
+        out.push('');
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
 function extractOutlineTagFromContent(text) {
   const t = normalizeTightOutlineSpacing(String(text || '').trim());
   if (!t) return null;
@@ -1995,9 +2015,9 @@ function reconcileDocumentStructure(lines, opts) {
         jp.tag &&
         NUMERIC_OUTLINE_FAMILIES.has(jp.tag.family) &&
         ((jp.kind === 'bullet' && jp.tabDepth === 0) || (jp.kind === 'other' && !/^[ \t]/.test(out[j]))) &&
-        jp.tag.text.length <= 56 &&
-        (!isSentenceOrColonProse(jp.tag.text) || isEligibleOutlineText(jp.tag.family, jp.tag.text)) &&
-        !isContiguousProseListAt(parsed, j, fenced)
+        (jp.tag.family === 'num_dot' || jp.tag.family === 'half_paren'
+          ? jp.tag.text.length <= 180
+          : (jp.tag.text.length <= 56 && (!isSentenceOrColonProse(jp.tag.text) || isEligibleOutlineText(jp.tag.family, jp.tag.text)) && !isContiguousProseListAt(parsed, j, fenced)))
       ) {
         const famRank = koreanRankOfFamily(jp.tag.family);
         let parentLvl = secParentLevel;
@@ -2064,6 +2084,10 @@ function reconcileDocumentStructure(lines, opts) {
         const famRank = docAlignRanks[p.tag.family] || p.tag.rank || 5;
         let par = { idx: -1, level: 0, family: 'root', rank: 0 };
         for (let k = pStack.length - 1; k >= 0; k--) {
+          if (pStack[k].family === p.tag.family && (p.tag.family === 'half_paren' || p.tag.family === 'num_dot') && isContiguousProseListAt(pLines, i, fenced)) {
+            par = pStack[k];
+            break;
+          }
           if (pStack[k].family !== p.tag.family && pStack[k].rank < famRank) {
             par = pStack[k];
             break;
@@ -2118,22 +2142,28 @@ function reconcileDocumentStructure(lines, opts) {
     let changedAny = false;
     for (const [parLevel, tier] of tierStats.entries()) {
       const hList = tier.headings;
-      if (hList.length === 0) continue;
+      const hasSameFamilyParentBucket = (fam === 'half_paren' || fam === 'num_dot') && Array.from(tier.byParentIdx.keys()).some(
+        (pIdx) => pIdx >= 0 && parsed[pIdx] && parsed[pIdx].tag && parsed[pIdx].tag.family === fam
+      );
+      if (hList.length === 0 && !hasSameFamilyParentBucket) continue;
       if (hList.length === 1 && hList[0].ordinal > 1 && tier.unpromotedCount >= 2) continue;
-      if (isNumericFam ? !hList.some((h) => !h.isProse) : hList.some((h) => h.isProse)) continue;
+      if (isNumericFam ? false : hList.some((h) => h.isProse)) continue;
 
       const minValidLevel = fam === 'cap_alpha' ? 1 : Math.max(2, parLevel + 1);
-      const tierTargetLevel = Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...hList.map((h) => h.level))));
+      const tierTargetLevel = hList.length > 0
+        ? Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...hList.map((h) => h.level))))
+        : Math.min(maxHeadingLevel, parLevel + 1);
 
       for (const [parIdx, pBucket] of tier.byParentIdx.entries()) {
         const bh = pBucket.headings;
+        const parTagFam = parIdx >= 0 && parsed[parIdx] && parsed[parIdx].tag ? parsed[parIdx].tag.family : '';
+        if (hList.length === 0 && parTagFam !== fam) continue;
         const candidateUnpromoted = pBucket.unpromoted.filter((uIdx) => {
           const p = parsed[uIdx];
-          if (isNumericFam && isContiguousProseListAt(parsed, uIdx, fenced)) return false;
+          if (fam === 'full_paren' && isContiguousProseListAt(parsed, uIdx, fenced)) return false;
           const fitsNumericHeading =
             isNumericFam &&
-            p.tag.text.length <= 62 &&
-            !/[.?!]["'”’)]*\s+[가-힣“"'(]/.test(p.tag.text.replace(/^\d{1,2}[.)]\s*/, '')) &&
+            p.tag.text.length <= (fam === 'full_paren' ? 62 : 180) &&
             !/%%|\*\*\*/.test(p.tag.text);
           const fitsNonNumericHeading =
             !isNumericFam &&
@@ -2142,35 +2172,13 @@ function reconcileDocumentStructure(lines, opts) {
             !(p.tag.text.length > 44 && /,/.test(p.tag.text));
           return (fitsNumericHeading || fitsNonNumericHeading) && !/^>/.test(p.body);
         });
-        // If an entire numeric section (>= 4 headings, e.g. 1.~9. "~알아야 한다.") is exclusively full declarative sentences with zero child subheadings, demote back to numbered points.
-        if (fam === 'num_dot' && bh.length >= 4 && pBucket.unpromoted.length === 0 && bh.every((h) => isSentenceOrColonProse(h.body) && /[다][.?!]?$/.test(h.body.replace(/\*\*|__|~~|<\/?u>/gi, '').trim()))) {
-          const hasChildHeadingUnderRun = bh.some((h) => {
-            for (let k = h.idx + 1; k < parsed.length; k++) {
-              if (parsed[k].kind === 'heading') return parsed[k].level > h.level;
-            }
-            return false;
-          });
-          if (!hasChildHeadingUnderRun) {
-            for (const h of bh) {
-              out[h.idx] = h.body;
-              changedAny = true;
-            }
-            continue;
-          }
-        }
         // Preserve an already-uniform section if it has zero unpromoted heading-like siblings
         const levelsHere = new Set(bh.map((h) => h.level));
         if (bh.length > 0 && levelsHere.size === 1 && bh[0].level > parLevel && candidateUnpromoted.length === 0) {
           continue;
         }
-        // If this section has zero existing headings for this family and any unpromoted item in it is a long prose item (e.g. 1.~11. prose + short 12.~13.), don't cherry-pick 12.~13.
-        if (bh.length === 0 && pBucket.unpromoted.length > candidateUnpromoted.length && isNumericFam) {
+        if (bh.length === 0 && pBucket.unpromoted.length > candidateUnpromoted.length && isNumericFam && fam === 'full_paren') {
           continue;
-        }
-        // If section has zero pre-existing headings and all items in this numbered run are full declarative sentences (~다.), keep as numbered points rather than headings
-        if (bh.length === 0 && isNumericFam && pBucket.unpromoted.length >= 2) {
-          const allProseSentences = pBucket.unpromoted.every((uIdx) => isSentenceOrColonProse(parsed[uIdx].tag.text));
-          if (allProseSentences) continue;
         }
         const localTarget = bh.length > 0
           ? Math.min(maxHeadingLevel, Math.max(minValidLevel, Math.min(...bh.map((h) => h.level))))
@@ -2331,19 +2339,10 @@ function reconcileDocumentStructure(lines, opts) {
       const headings = run.filter((x) => x.kind === 'heading');
       const ordered = run.filter((x) => x.kind === 'ordered');
       if (headings.length === 0 || ordered.length === 0) continue;
-      // Only reconcile if run items are genuine sibling steps (not e.g. headings.length >= 2 where none are prose while ordered starts after)
-      const anyProse = run.some((x) => x.isProse);
-      const headingProse = headings.some((x) => x.isProse);
-      const longOrderedProse = ordered.some((x) => x.body.length > 42 || (x.body.match(/,/g) || []).length >= 2);
-      if (ordered.length > headings.length || (headings.length === 1 && (anyProse || longOrderedProse))) {
-        for (const h of headings) {
-          out[h.idx] = h.body;
-        }
-      } else if (headings.length >= 2 && !headingProse && !longOrderedProse) {
-        const targetLevel = Math.min(maxHeadingLevel, Math.min(...headings.map((h) => h.level)));
-        for (const o of ordered) {
-          out[o.idx] = `${'#'.repeat(targetLevel)} ${o.body}`;
-        }
+      // Reconcile unpromoted col-0 1./2./3. or 1)/2)/3) siblings inside the same section into the unified heading level
+      const targetLevel = Math.min(maxHeadingLevel, Math.min(...headings.map((h) => h.level)));
+      for (const o of ordered) {
+        out[o.idx] = `${'#'.repeat(targetLevel)} ${o.body}`;
       }
     }
   }
@@ -2872,8 +2871,9 @@ function refineMarkdownByRules(rawText, options = {}) {
   let inFence = false;
   const indentStack = []; // tracks indent widths for list nesting -> tabs
   const headingStack = []; // tracks active heading ranks -> markdown heading levels 1..6
+  let hadProseSinceHeading = false;
 
-  const pushHeadingRank = (rank, minLevel, titleText) => {
+  const pushHeadingRank = (rank, minLevel, titleText, extra = null) => {
     while (headingStack.length > 0 && headingStack[headingStack.length - 1].rank >= rank) {
       headingStack.pop();
     }
@@ -2882,8 +2882,9 @@ function refineMarkdownByRules(rawText, options = {}) {
     if (level > maxHeadingLevel) {
       return null;
     }
-    headingStack.push({ rank, level });
+    headingStack.push(Object.assign({ rank, level }, extra || {}));
     indentStack.length = 0;
+    hadProseSinceHeading = false;
     return `${'#'.repeat(level)} ${titleText}`;
   };
 
@@ -2975,7 +2976,7 @@ function refineMarkdownByRules(rawText, options = {}) {
             if (dir === 1 && cand.kind === 'heading_num_candidate' && cand.numVal === 2) return true;
             continue;
           }
-          if (cand.numVal >= 2 && cand.numVal <= 20) return true;
+          if (cand.numVal >= 2 && cand.numVal <= 30) return true;
         }
       }
     }
@@ -3051,8 +3052,9 @@ function refineMarkdownByRules(rawText, options = {}) {
       const adjLevel = (isHalfParenH || isFullParenH || isCircledH) && parentLvl >= info.level && parentLvl + 1 <= maxHeadingLevel
         ? parentLvl + 1
         : info.level;
-      headingStack.push({ rank: effRank, level: adjLevel });
+      headingStack.push({ rank: effRank, level: adjLevel, isHalfParen: isHalfParenH });
       indentStack.length = 0;
+      hadProseSinceHeading = false;
       if (activeCircledPass && adjLevel <= activeCircledPass.level) {
         activeCircledPass = null;
       }
@@ -3078,12 +3080,18 @@ function refineMarkdownByRules(rawText, options = {}) {
         continue;
       }
       const canPromoteNumCandidate =
-        !hasExistingH2 ||
-        (!hasExplicitNumDotHeading && (hasOrderedSibling(i, 0) || hasDocHalfParenSub));
-      if (allowPromote && info.kind === 'heading_num_candidate' && canPromoteNumCandidate) {
-        const isOrphanLongNum1 = info.numVal === 1 && info.title.length > 20 && !hasOrderedSibling(i, 0);
+        info.kind === 'heading_num_candidate' && (
+          !hasExistingH2 ||
+          hasExplicitNumDotHeading ||
+          hasOrderedSibling(i, 0) ||
+          hasDocHalfParenSub ||
+          (info.title || '').replace(/\*\*|__|~~|<\/?u>/gi, '').trim().length <= 42
+        );
+      if (allowPromote && canPromoteNumCandidate) {
+        const plainTitle = (info.title || '').replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
+        const isOrphanLongNum1 = info.numVal === 1 && plainTitle.length > 42 && !hasOrderedSibling(i, 0);
         if (!isOrphanLongNum1) {
-          const hLine = pushHeadingRank(2.5, 2, `${info.num}. ${info.title}`);
+          const hLine = pushHeadingRank(2, 2, `${info.num}. ${info.title}`);
           if (activeCircledPass && headingStack.length > 0 && headingStack[headingStack.length - 1].level <= activeCircledPass.level) {
             activeCircledPass = null;
           }
@@ -3170,12 +3178,15 @@ function refineMarkdownByRules(rawText, options = {}) {
           return !!(hasLead && followedByMajorH);
         };
 
+        const nestedUnderHalfParen = isHalfParenSub && headingStack.some((h) => h.isHalfParen);
+        const indentedSublistUnderProse = info.indent > 0 && hadProseSinceHeading && !isCircledSub;
         const shouldPromoteToHeading =
           allowPromote &&
           allowFromBullet &&
           effCanBeHeading &&
+          !indentedSublistUnderProse &&
           !isIntroPreviewSummaryAt() &&
-          !isContiguousProseListAt(parsedLines, i, null) &&
+          !((nestedUnderHalfParen || isFullParenSub) && isContiguousProseListAt(parsedLines, i, null)) &&
           (isCircledSub ? maxHeadingLevel >= 2 : maxHeadingLevel >= 3) &&
           !inActiveSiblingList &&
           (isCircledSub || !hasExistingHeadings || headingStack.length > 0);
@@ -3190,7 +3201,7 @@ function refineMarkdownByRules(rawText, options = {}) {
               useMin = Math.min(maxHeadingLevel, activeCircledPass.level + 1);
             }
           }
-          const hLine = pushHeadingRank(useRank, useMin, `${info.marker} ${info.body}`);
+          const hLine = pushHeadingRank(useRank, useMin, `${info.marker} ${info.body}`, { isHalfParen: isHalfParenSub });
           if (hLine) {
             if (isCircledSub) {
               const ord = info.marker.charCodeAt(0) - 0x2460 + 1;
@@ -3332,6 +3343,7 @@ function refineMarkdownByRules(rawText, options = {}) {
     if (activeCircledPass) activeCircledPass.hadProse = true;
     if (info.kind === 'plain') {
       indentStack.length = 0;
+      hadProseSinceHeading = true;
       // Preserve intentional tab indentation if not list, else trim leading copy-paste clutter spaces
       processedLines.push(info.text);
     } else {
@@ -3357,7 +3369,10 @@ function refineMarkdownByRules(rawText, options = {}) {
   });
 
   // Fifth pass: whole-document consistency reconciliation (inspect entire outline & fix parent/sibling inversions)
-  const finalLines = reconcileDocumentStructure(verseCleanLines, opts);
+  let finalLines = reconcileDocumentStructure(verseCleanLines, opts);
+  if (isGeneralDoc && opts.normalizeBibleRefs !== false) {
+    finalLines = padGeneralStandaloneBibleVerses(finalLines);
+  }
 
   // Collapse 3+ consecutive newlines to 2 (1 blank line)
   let joined = finalLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -3502,8 +3517,7 @@ function buildGlobalOutlinePlanPrompt(fullBody, headingScope = 'h1_h6', customNo
 ${getHeadingGuideForAi(headingScope)}
 2. **제목1('# ')부터 시작 & 하위 제목까지 문서 전체 일관성 (가장 중요)**:
    - 문서 맨 첫 줄의 전체 파일 제목(예: '# 성경의 선용과 악용')은 '# ' 제목1에 두지 말고 일반 굵은 제목('**성경의 선용과 악용**')으로 내려 둔 뒤, 본문의 큰 대단원('■ ...', '● ...', 'Ⅰ. ...')부터 **반드시 '# '(제목1)** → 중지 '## ' → 소지 '### ' 순서로 시작하십시오. 문서 전체를 제목2('## ') 몇 개로만 시작하고 그 아래 소제목('1. ...', '1) ...', '① ...')을 빠뜨리는 불완전한 설계를 금지합니다!
-   - 문서 전체에서 **같은 기호/체계('■ ...', '● ...', '1. ...', '1) ...')** 를 쓰는 형제 항목 중 제목 성격의 짧은 어구는 문서 처음부터 끝까지 빠짐없이 같은 '#' 등급으로 잡으십시오.
-   - 반대로, **긴 완전한 서술 문장형 번호('1. 창조주가 없다는 ... 주장이다.', '2. 율법을 ... 같다.')나 성경 구절 인용·단순 예화 문장**은 문맥상 본문/목록이지 제목이 아니므로 제목으로 올리지 말고 **명확한 제목 역할만** 계층에 넣으십시오.
+   - 문서 전체에서 **같은 기호/체계('■ ...', '● ...', '1. ...', '1) ...')** 를 쓰는 형제 항목은 문장이 길거나 '~다.'로 끝나더라도(들여쓴 '\t1.' 목록과 맨 앞 대지 앞 서론 요약 '1)~3)' 제외) 문서 처음부터 끝까지 빠짐없이 같은 '#' 제목 등급으로 통일해 계층에 넣으십시오.
 3. **출력 형식**:
    - 인사말·설명·코드블록(\`\`\`) 없이, 문서 등장 순서대로 **'# ~ ######' 제목 줄만** 1줄에 하나씩 출력하십시오.${docProfile === 'general' ? '\n4. [일반 문서 양식]: 일반 원고·단행본이므로 서술 문단에 마인드맵용 \'- \'(대지 불릿)를 붙이지 말고 평문 문단으로 두십시오.' : ''}${customNote ? `\n${docProfile === 'general' ? '5' : '4'}. [다시 강조 — 사용자 추가 지시 최우선]: ${customNote}` : ''}
 
@@ -3525,7 +3539,8 @@ function buildAiPrompt(mode, chunkText, customNote, headingScope = 'h1_h6', auto
 - 이 문서는 개인 설교 마인드맵이 아닌 **일반 원고/단행본**입니다.
 - **절대 문단 앞에 마인드맵용 '- '(대지 기호)나 '\\t- ' 탭 목록을 새로 붙이지 마십시오.** (원본 서술 문장에 붙은 '- ', '✓ '는 일반 평문 단락으로 푸십시오.)
 - 본문 설명·예화·인용은 문맥에 맞는 자연스러운 일반 평문 단락으로 두고, **제목(#~######)과 제목 아래 붙어 나온 설명 문장·한 줄에 연달아 붙은 '5. ... 6. ...' 번호 항목은 반드시 줄바꿈으로 분리**하십시오.
-- 맨 위 문서 전체 제목 1줄('# 성경의 선용과 악용' 등)은 '**...**' 굵은 제목으로 내리고, 본문의 큰 대지('■ ...', '● ...')부터 **제목1('# ')부터** 일관되게 계층을 잡으며, 긴 서술 문장형 '1. ~다., 2. ~다.'나 서론 요약 '1)~3)'은 제목으로 올리지 말고 일반 번호 문단으로 유지하십시오.`
+- 맨 위 문서 전체 제목 1줄('# 성경의 선용과 악용' 등)은 '**...**' 굵은 제목으로 내리고, 본문의 큰 대지('■ ...', '● ...')부터 **제목1('# ')부터** 일관되게 계층을 잡으며, 줄바꿈 앞의 col-0 \`1. 2. 3.\`·\`1) 2) 3)\` 번호·글머리 기호도 문장 길이와 무관하게 하이어라키를 통일하여 모두 제목 서식(\`## 1.\`, \`### 1)\` 등)으로 올리십시오(맨 앞 대지 앞 서론 미리보기 '1)~3)'과 들여쓴 '\t1.' 제외).
+- 성경 구절(\`(장:절) 말씀...\`)만 독립된 줄로 쓸 때는 구절 위아래에 빈 줄을 1줄씩 두십시오.`
     : '';
 
   const commonRules = `당신은 목회자/신학자의 옵시디언 설교·성경연구 노트 편집 도우미입니다.
@@ -3557,10 +3572,10 @@ ${autoNumNote}
     ? `  3. **제목·번호 분리 및 문단 줄바꿈 정리 (매우 중요)**:
      - **제목/소제목 뒤에 설명 문장이나 성구 인용이 바로 한 줄에 붙어 있으면** (예: \`**3) ... 드러냄** 하나님 불의하다?\`, \`**1. 성령을 받을 때...** "기록된바..."\`) **반드시 줄바꿈으로 제목과 아래 본문을 분리**하십시오.
      - **한 줄 안에 다음 번호가 이어붙은 경우** (예: \`**5. ... 같다.** **6. 교회를...**\`, \`...연약함 **3. 하나님이...**\`) 반드시 각 번호마다 새 문단으로 나누십시오.
-     - 문맥상 **제목 역할인 짧은 '1. / 1) / ①'** 은 문서 전체에서 빠뜨리지 말고 일관된 '#' 등급으로 올리고, **긴 서술 문장형 '1. ~다., 2. ~다.'는 제목으로 올리지 말고 일반 번호 문단으로** 두십시오.
+     - **\`1. 2. 3.\`·\`1) 2) 3)\` 글머리 통일 승격**: 들여쓰기 없는 \`1. / 2. / 3.\`, \`1) / 2) / 3)\` 번호 항목은 길이나 서술형('~다.') 여부에 상관없이 문서 전체 하이어라키를 통일하여 모두 제목 서식(\`## 1.\`, \`### 1)\` 등)으로 승격시키십시오(맨 앞 대지 앞 서론 요약 '1)~3)'·들여쓴 '\\t1.' 제외).
   4. **성경 구절 정규화 및 설명 분리 (매우 중요)**:
      - \`"말씀..."(요 18:1-11).\`처럼 본문 뒤에 장절이 붙은 독립 성경 인용은 \`(요 18:1-11) 말씀...\` 형태로 앞장절 표기로 통일하십시오(단, \`예수님은 "너희가..."(막 12:24)라고 하셨다.\`처럼 문장 서술어에 직접 연결된 인용은 문장 안에 유지).
-     - **성경 구절 줄과 구절 앞/뒤에 붙은 설명 문구·다른 성구 인용은 절대 같은 줄에 붙여 두지 말고 반드시 줄바꿈으로 분리**하고, 원문에 없던 '>' 인용 기호를 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`
+     - **성경 구절 줄과 구절 앞/뒤에 붙은 설명 문구·다른 성구 인용은 절대 같은 줄에 붙여 두지 말고 반드시 줄바꿈으로 분리**하고, **독립된 성경 구절 위·아래에는 빈 줄을 1줄씩 두십시오.** 원문에 없던 '>' 인용 기호는 새로 붙이지 말고 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`
     : `  3. **번호·대지 기호 중복, \`-.\` 기호 및 공백 누락 방지 (매우 중요)**:
      - '1) 제목', '2) 제목', '1. 제목', '2. 제목' 앞에 **절대 '- '를 붙이지 마십시오** ('- 1) ...' ❌ → '1) ...' 또는 '\\t1) ...' ⭕, 제목이면 '## 1) ...'). '- 1)'로 쓰면 뷰어에서 '✓ 1)'처럼 대지 기호와 번호가 겹쳐 나옵니다.
      - 반대로 사용자가 직접 지정한 \`✓ 1. ...\`, \`✓ 1) ...\`(숫자 대지 기호) 줄은 '✓ '를 지우거나 제목(#)으로 바꾸지 말고 원형 그대로 유지하십시오.
@@ -4306,6 +4321,9 @@ class SermonMdRefinerPlugin extends Plugin {
           headingLevelScope: effectiveScope,
           autoNumberedStyle: effectiveNumStyle
         });
+        if (effectiveDocProfile === 'general' && effectiveRuleOpts.normalizeBibleRefs !== false) {
+          postLines = padGeneralStandaloneBibleVerses(postLines);
+        }
         assembled = postLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
       }
     }
