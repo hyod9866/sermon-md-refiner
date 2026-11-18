@@ -350,6 +350,52 @@ function convertPandocUnderlineTags(text) {
   }).join('\n');
 }
 
+function convertHtmlParagraphAndBreakTags(text) {
+  const input = String(text || '');
+  if (!/<\/?(?:p|br)(?:\s|>|\/)/i.test(input)) return input;
+  const lines = input.split('\n');
+  let fence = false;
+  const out = [];
+  for (const line of lines) {
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      fence = !fence;
+      out.push(line);
+      continue;
+    }
+    if (fence) {
+      out.push(line);
+      continue;
+    }
+    // Preserve <br> inside Markdown tables (needed for cell line breaks), strip <p>/</p> cleanly
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      const tbl = line
+        .replace(/<\/p(?:\s[^>]*)?>\s*<p(?:\s[^>]*)?>/gi, '<br>')
+        .replace(/<\/?p(?:\s[^>]*)?>/gi, '')
+        .replace(/<br(?:\s+[^>]*)?\s*\/?>/gi, '<br>');
+      out.push(tbl);
+      continue;
+    }
+    const parts = line.split(/(`[^`]*`)/g);
+    for (let i = 0; i < parts.length; i += 2) {
+      let seg = parts[i];
+      if (!/<\/?(?:p|br)(?:\s|>|\/)/i.test(seg)) continue;
+      seg = seg.replace(/^[ \t]*#{1,6}[ \t]*(?:<\/?p(?:\s[^>]*)?>[ \t]*)+$/gi, '');
+      seg = seg.replace(/^([ \t]*(?:[-*+]\s+|>\s+))<p(?:\s[^>]*)?>[ \t]*/gi, '$1');
+      seg = seg.replace(/[ \t]*(?:<br(?:\s+[^>]*)?\s*\/?>[ \t]*){2,}/gi, '\n\n');
+      seg = seg.replace(/[ \t]*<br(?:\s+[^>]*)?\s*\/?>[ \t]*/gi, '\n');
+      seg = seg.replace(/[ \t]*<\/p>[ \t]*(?:<p(?:\s[^>]*)?>[ \t]*)?/gi, '\n\n');
+      seg = seg.replace(/([^\n])[ \t]*<p(?:\s[^>]*)?>[ \t]*/gi, '$1\n\n');
+      seg = seg.replace(/^[ \t]*<p(?:\s[^>]*)?>[ \t]*/gim, '');
+      parts[i] = seg;
+    }
+    const joinedSeg = parts.join('');
+    for (const subLine of joinedSeg.split('\n')) {
+      out.push(subLine.replace(/[ \t]+$/g, ''));
+    }
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
 function normalizeHwpDashBullets(text) {
   const input = String(text || '');
   const lines = input.split('\n');
@@ -2784,7 +2830,9 @@ function extractLeadingMetadataFrontmatter(rawLines) {
 function refineMarkdownByRules(rawText, options = {}) {
   const opts = Object.assign({}, DEFAULT_SETTINGS, options);
   const { frontmatter, body } = splitFrontmatter(rawText);
-  let text = normalizeHwpDashBullets(unescapePandocMarkdown(decodeHtmlEntities(body)))
+  let text = convertHtmlParagraphAndBreakTags(
+    normalizeHwpDashBullets(unescapePandocMarkdown(decodeHtmlEntities(body)))
+  )
     .replace(/[\u00A0\u200B\uFEFF]/g, (ch) => (ch === '\u00A0' ? ' ' : ''));
 
   let rawLines = text.split('\n').map((l) => l.replace(/[ \t]+$/g, ''));
@@ -3538,6 +3586,7 @@ ${headingGuide}
   2. **끊긴 줄바꿈·어색한 빈 줄(\\n\\n) 연결 및 밑줄 변환 (매우 중요)**:
      - PDF·HWP·DOCX 변환 때문에 **한 문장이나 한 성경 본문 인용, \`<u>...</u>\` / \`[...]{.underline}\` / \`*\*...**\`, 부사·관형어·연결어미 중간이 줄바꿈이나 빈 줄(\\n\\n)로 토막나 있으면** (예: \`(잠 1:10-19) (10) ... (11) 그들이\\n\\n네게 말하기를 ...\`, \`시간을 소중히\\n\\n여길 수 있다.\`, \`그리스도 앞에서 서야\\n\\n한다.\`, \`...보면 그\\n\\n시간이 ...\`, \`*\*... 제 삼\\n\\n일에 살아나야...\*\*\`), **원본의 어색한 줄바꿈과 빈 줄을 그대로 두지 말고 문장·구절이 끝날 때까지 띄어쓰기 1칸으로 자연스럽게 한 문장·한 인용 문단으로 이어 붙이십시오.**
      - Pandoc 밑줄(\`[텍스트]{.underline}\`)은 반드시 옵시디언 HTML 밑줄 태그인 \`<u>텍스트</u>\` 형태로 유지·변환하고, \`{.underline}\` 문법을 그대로 남기지 마십시오.
+     - HTML 문단·줄바꿈 태그(\`<p>\`, \`</p>\`, \`<br>\`)는 표(\`| ... |\`) 내부의 \`<br>\`을 제외하고 실제 줄바꿈/문단 나누기로 변환한 뒤 태그 문자열은 모두 제거하고, 해당 줄을 제목·목록·본문 서식에 맞게 정리하십시오(단, \`<u>...</u>\`·\`<font ...>\` 서식 태그는 유지).
 ${outlineAndIndentRules}
 ${customNote ? `\n🚨 [최종 확인 — 사용자 추가 지시 최우선 적용]: ${customNote}` : ''}
 
@@ -4143,7 +4192,9 @@ class SermonMdRefinerPlugin extends Plugin {
     // Non-destructive prep: keep raw outline intact so AI sees real semantics, while unescaping Pandoc artifacts and stitching hard-wrapped half-sentences
     const { frontmatter: origFm, body: origBody } = splitFrontmatter(rawText);
     const origQuotedKeys = extractQuotedVerseKeys(origBody);
-    let cleanBody = normalizeHwpDashBullets(unescapePandocMarkdown(decodeHtmlEntities(origBody)))
+    let cleanBody = convertHtmlParagraphAndBreakTags(
+      normalizeHwpDashBullets(unescapePandocMarkdown(decodeHtmlEntities(origBody)))
+    )
       .replace(/\r\n/g, '\n')
       .replace(/[\u00A0\u200B\uFEFF]/g, (ch) => (ch === '\u00A0' ? ' ' : ''));
     let frontmatter = origFm;
@@ -4232,7 +4283,9 @@ class SermonMdRefinerPlugin extends Plugin {
         }));
         assembled = postBody.trim();
       } else {
-        let postLines = normalizeHwpDashBullets(unescapePandocMarkdown(assembled)).split('\n');
+        let postLines = convertHtmlParagraphAndBreakTags(
+          normalizeHwpDashBullets(unescapePandocMarkdown(assembled))
+        ).split('\n');
         if (effectiveRuleOpts.mergeBrokenLines !== false) {
           postLines = mergeBrokenLinesPass(postLines, effectiveRuleOpts.vaultBasePath || '');
         }
