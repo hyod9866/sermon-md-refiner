@@ -175,8 +175,9 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
   });
 
   // Ensure a space after normalized Bible ref when immediately followed by verse/word: "(눅 9:51)예수께서" -> "(눅 9:51) 예수께서"
+  // Preserve direct Korean particles attached to citations: "(막 12:24)라고", "(창 1:1)에", "(롬 8:1)의"
   const tightVerseGapRe = new RegExp(
-    `(\\((?:${BOOK_PATTERN})\\s+\\d{1,3}:\\d{1,3}(?:-\\d{1,3})?\\))([가-힣A-Za-z0-9“"'(])`,
+    `(\\((?:${BOOK_PATTERN})\\s+\\d{1,3}:\\d{1,3}(?:-\\d{1,3})?\\))(?!(?:이?(?:라고|라며|라는|란|고(?=\\s|$|[,.?!]))|에(?:서|는|게)?(?=\\s|$|[,.?!])|으로(?=\\s|$|[,.?!])|로(?=\\s|$|[,.?!])|을(?=\\s|$|[,.?!])|를(?=\\s|$|[,.?!])|은(?=\\s|$|[,.?!])|는(?=\\s|$|[,.?!])|이(?=\\s|$|[,.?!])|가(?=\\s|$|[,.?!])|의(?=\\s|$)|와(?=\\s|$|[,.?!])|과(?=\\s|$|[,.?!])|도(?=\\s|$|[,.?!])|만(?=\\s|$|[,.?!])|처럼|같이))([가-힣A-Za-z0-9“"'(])`,
     'g'
   );
   rest = rest.replace(tightVerseGapRe, '$1 $2');
@@ -190,7 +191,35 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
     return `${bulletPrefix || ''}(${short} ${ch}:${vs.replace(/\s+/g, '').replace(/[～~]/g, '-')})${tail}`;
   });
 
+  // Standalone quoted verse with trailing ref: '“말씀...”(요 18:1-11).' -> '(요 18:1-11) 말씀...'
+  rest = normalizeStandaloneQuotedBibleRef(rest);
+
   return leading + rest;
+}
+
+function normalizeStandaloneQuotedBibleRef(restText) {
+  const s = String(restText || '');
+  const listM = s.match(/^((?:[-*+]\s+)?(?:>\s+)?)(.+)$/);
+  if (!listM) return s;
+  const prefix = listM[1] || '';
+  const body = listM[2].trim();
+  const m = body.match(
+    new RegExp(
+      `^[“"]([^\\n]{6,}?)[”"“]{1,2}\\s*\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\)[.?!]?$`
+    )
+  );
+  if (m) {
+    const inner = m[1].trim();
+    // Ensure there isn't another closing quote followed by an earlier "(BOOK ...)" inside inner
+    const earlierClosing = new RegExp(`[”"“]\\s*\\(\\s*(?:${BOOK_PATTERN})\\s*\\d{1,3}\\s*[:：]`).test(inner);
+    if (!earlierClosing) {
+      const short = BOOK_FULL_TO_SHORT.get(m[2]) || m[2];
+      const ch = m[3];
+      const vs = m[4].replace(/\s+/g, '').replace(/[～~]/g, '-');
+      return `${prefix}(${short} ${ch}:${vs}) ${inner}`;
+    }
+  }
+  return s;
 }
 
 const QUOTED_VERSE_LINE_RE = new RegExp(
@@ -729,9 +758,15 @@ function hasActiveVerseRangeTail(prevTrimmed, nextTrimmed) {
   if (!nTrim || /^\s*(?:[-*+]\s*)?>/.test(nTrim) || isListLine(nextTrimmed)) return false;
   if (BIBLE_REF_HEADER_RE.test(nTrim.replace(/^[-*+>\s]+/, ''))) return false;
   const cleanP = prevTrimmed.replace(/^(?:[-*+]\s*)?>\s*/, '');
-  const rangeM = cleanP.match(new RegExp(`^\\(?(?:${BOOK_PATTERN})\\s*\\d{1,3}:\\d{1,3}\\s*[-~]\\s*(\\d{1,3})\\)?`));
+  const rangeM = cleanP.match(new RegExp(`^\\(?(?:${BOOK_PATTERN})\\s*\\d{1,3}:(\\d{1,3})\\s*[-~]\\s*(\\d{1,3})\\)?\\s*(.*)$`));
   if (!rangeM) return false;
-  const endVerse = parseInt(rangeM[1], 10);
+  const startVerse = parseInt(rangeM[1], 10);
+  const endVerse = parseInt(rangeM[2], 10);
+  const bodyAfterHeader = rangeM[3] || '';
+  const hasInlineVerseMarkers =
+    new RegExp(`(?:^|\\s)(?:\\[${startVerse}\\]|\\(${startVerse}\\)|${startVerse}(?=[가-힣]|\\s))`).test(bodyAfterHeader) ||
+    /^(?:\[\d{1,3}\]|\(\d{1,3}\))/.test(nTrim);
+  if (!hasInlineVerseMarkers) return false;
   // Check whether endVerse has already appeared in prevTrimmed (supporting [17], (17), or 17한글/17 )
   const endVerseRe = new RegExp(`\\[${endVerse}\\]|\\(${endVerse}\\)|\\b${endVerse}(?=[가-힣]|\\s)`);
   if (!endVerseRe.test(cleanP)) return true;
@@ -859,6 +894,360 @@ function doesLineContinueBiblePassage(prevLine, curLine, bibleMaps) {
   return null;
 }
 
+function getRealBibleTexts(abbr, chap, v1, v2, bibleMaps) {
+  const out = [];
+  if (!bibleMaps || bibleMaps.length === 0) return out;
+  for (const bMap of bibleMaps) {
+    const parts = [];
+    for (let v = v1; v <= v2; v++) {
+      const txt = bMap.get(`${abbr}:${chap}:${v}`);
+      if (txt) parts.push(txt);
+    }
+    if (parts.length > 0) {
+      out.push({
+        bMap,
+        realNorm: normBibleHangul(parts.join(' ')),
+        lastNorm: normBibleHangul(parts[parts.length - 1] || ''),
+        nextNorm: normBibleHangul(bMap.get(`${abbr}:${chap}:${v2 + 1}`) || '')
+      });
+    }
+  }
+  return out;
+}
+
+function doesTextStartBibleVerse(bodyText, abbr, chap, v1, v2, bibleMaps) {
+  const entries = getRealBibleTexts(abbr, chap, v1, v2, bibleMaps);
+  if (entries.length === 0) return false;
+  const bNorm = normBibleHangul(bodyText);
+  if (bNorm.length < 6) return false;
+  const probe = bNorm.slice(0, Math.min(10, bNorm.length));
+  return entries.some((e) => {
+    const idx = e.realNorm.indexOf(probe);
+    return idx >= 0 && idx <= 20;
+  });
+}
+
+function isBiblePassageCompleteAgainstLookup(line, curLine, bibleMaps) {
+  if (!bibleMaps || bibleMaps.length === 0 || !line) return false;
+  const hm = String(line).match(BIBLE_REF_HEADER_RE);
+  if (!hm) return false;
+  const abbr = BOOK_FULL_TO_SHORT.get(hm[1]) || hm[1];
+  const chap = parseInt(hm[2], 10);
+  const v1 = parseInt(hm[3], 10);
+  const v2 = hm[4] ? Math.min(v1 + 30, parseInt(hm[4], 10)) : v1;
+  const prevNorm = normBibleHangul(hm[5] || '');
+  if (prevNorm.length < 6) return false;
+  const entries = getRealBibleTexts(abbr, chap, v1, v2, bibleMaps);
+  if (entries.length === 0) return false;
+  const curNorm = normBibleHangul(curLine || '');
+  return entries.some((e) => {
+    const tailLen = Math.min(8, e.lastNorm.length);
+    if (tailLen < 5) return false;
+    const tail = e.lastNorm.slice(-tailLen);
+    if (!prevNorm.endsWith(tail) && !prevNorm.slice(-14).includes(tail)) return false;
+    // Make sure curLine isn't closing bold/underline/punctuation from the same verse
+    if (curNorm.length < 4) return false;
+    return true;
+  });
+}
+
+function findBibleVerseSplitTailIndex(restText, abbr, chap, v1, v2, bibleMaps) {
+  const rest = String(restText || '');
+  if (!rest || rest.length < 16 || !bibleMaps || bibleMaps.length === 0) return -1;
+  const entries = getRealBibleTexts(abbr, chap, v1, v2, bibleMaps);
+  if (entries.length === 0) return -1;
+
+  // Candidate boundaries: sentence punctuation + space, OR classical Korean verse ending + space
+  const boundaryRe = /(?:[.?!。？！]+["'”’)*\]]*(?:\*\*|<\/u>)?|(?:니라|리라|도다|노라|지어다|나이다|소서|아멘|하더라|이라|더라|였더라|았더라|었더라|시더라|리요|느뇨|니이까|리이까|것이요)(?:\*\*|<\/u>)?)\s+(?=\S)/g;
+  let bestSplit = -1;
+  let m;
+  while ((m = boundaryRe.exec(rest)) !== null) {
+    const boundaryEnd = m.index + m[0].length;
+    const beforePart = rest.slice(0, m.index + m[0].trimEnd().length);
+    const afterPart = rest.slice(boundaryEnd).trim();
+    if (afterPart.length < 4) continue;
+    if (/^\((?:kjv|niv|esv|nkjv|개역|표준|새번역|공동|현대)/i.test(afterPart)) continue;
+    const beforeNorm = normBibleHangul(beforePart);
+    const afterNorm = normBibleHangul(afterPart);
+    if (beforeNorm.length < 6 || afterNorm.length < 4) continue;
+
+    for (const e of entries) {
+      const tailLen = Math.min(9, e.lastNorm.length);
+      if (tailLen < 5) continue;
+      const tail = e.lastNorm.slice(-tailLen);
+      const endsAtTail = beforeNorm.endsWith(tail) || beforeNorm.slice(-14).includes(tail);
+      if (!endsAtTail) continue;
+      const afterProbe = afterNorm.slice(0, Math.min(8, afterNorm.length));
+      if (e.realNorm.includes(afterProbe) || (e.nextNorm && e.nextNorm.startsWith(afterProbe))) continue;
+      bestSplit = boundaryEnd;
+    }
+  }
+  return bestSplit;
+}
+
+function findOpeningQuoteBefore(str, minIdx, closeIdx, closerChars) {
+  // Curly closing '”': pair matching '“' right-to-left tracking depth
+  if (closerChars.includes('”')) {
+    let depth = 1;
+    let fallbackAscii = -1;
+    for (let k = closeIdx - 1; k >= minIdx; k--) {
+      const ch = str[k];
+      if (ch === '”') depth++;
+      else if (ch === '“') {
+        depth--;
+        if (depth === 0) return k;
+      } else if (ch === '"' && fallbackAscii === -1) {
+        fallbackAscii = k;
+      }
+    }
+    if (fallbackAscii !== -1) return fallbackAscii;
+  }
+  // ASCII '"' or HWP swapped '“' closer: track ASCII pairs left-to-right inside [minIdx..closeIdx)
+  let openQuote = -1;
+  let inAscii = false;
+  for (let k = minIdx; k < closeIdx; k++) {
+    const ch = str[k];
+    if (ch === '"') {
+      if (!inAscii) {
+        inAscii = true;
+        openQuote = k;
+      } else {
+        inAscii = false;
+      }
+    } else if (ch === '“' && !inAscii) {
+      openQuote = k;
+    }
+  }
+  if (inAscii && openQuote !== -1) return openQuote;
+  if (openQuote !== -1 && closeIdx - openQuote >= 6) return openQuote;
+  return -1;
+}
+
+function splitAndNormalizeBiblePassagesPass(lines, opts = {}, bibleMapsInput = null) {
+  if (opts.normalizeBibleRefs === false) return lines;
+  const bibleMaps = Array.isArray(bibleMapsInput) ? bibleMapsInput : getBibleVerseLookup(opts.vaultBasePath || '');
+  const isGeneralDoc = opts.docProfile === 'general';
+  const trailingQuoteRefRe = new RegExp(
+    `([”"“]{1,2})\\s*[(\\[]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[)\\]]([.?!]?)`,
+    'g'
+  );
+  const embeddedFrontRefRe = new RegExp(
+    `((?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?)\\s+(.+)$`
+  );
+  const leadVerseLineRe = new RegExp(
+    `^([ \\t]*(?:[-*+]\\s+)?(?:>\\s+)?)(?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?\\s+(.+)$`
+  );
+  const inlineGrammarTailRe = /^(?:이?(?:라고|고(?:\s|$|[,.?!])|라며|이라는|라는|란|하[고며여셨습니]|말씀하)|(?:을|를|은|는|이|가|에|에서|으로|로|와|과|의|도|만|처럼|같이)(?=\s|$|[,.?!]))/;
+  const inlineSpaceGrammarTailRe = /^\s*(?:라고|이라고|하[셨고며습]|말씀하[셨고])/;
+
+  const out = [];
+  let inFence = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    if (/^\s*(?:```|~~~)/.test(rawLine)) {
+      inFence = !inFence;
+      out.push(rawLine);
+      continue;
+    }
+    const trim = rawLine.trim();
+    if (
+      inFence ||
+      !trim ||
+      /^(?:#{1,6}\s|\|.*\||---+$|\*\*\*+$|<!--|%%)/.test(trim) ||
+      /^(?:강사|장소|날짜|일시|본문|제목|주제|시간|비고|참고)\s*[:：]/.test(trim)
+    ) {
+      out.push(rawLine);
+      continue;
+    }
+
+    const leadMatch = rawLine.match(/^([ \t]*(?:(?:-\s+)?(?:>\s+)?|\*\s+))(.*)$/);
+    const leadFull = leadMatch ? leadMatch[1] : '';
+    const leadWs = rawLine.match(/^[ \t]*/)[0];
+    const hasTabBullet = /^\t+-\s+$/.test(leadFull) || (!isGeneralDoc && /^-\s+$/.test(leadFull));
+    const contLead = hasTabBullet ? `${leadWs}- ` : leadWs;
+    const work = leadMatch ? leadMatch[2] : rawLine;
+
+    // Step 1: Convert & split "~~~"(BOOK chap:verse) segments left-to-right
+    const stage1Segs = [];
+    trailingQuoteRefRe.lastIndex = 0;
+    let searchMin = 0;
+    let inlineAcc = '';
+    let firstSeg = true;
+    let rm;
+
+    const pushSeg = (segText) => {
+      const cleaned = segText.trim();
+      if (!cleaned) return;
+      const pfx = firstSeg ? leadFull : contLead;
+      stage1Segs.push(`${pfx}${cleaned}`);
+      firstSeg = false;
+    };
+
+    while ((rm = trailingQuoteRefRe.exec(work)) !== null) {
+      const closer = rm[1];
+      const closeStart = rm.index;
+      const matchEnd = rm.index + rm[0].length;
+      const bk = rm[2];
+      const ch = rm[3];
+      const vs = rm[4].replace(/\s+/g, '').replace(/[～~]/g, '-');
+      const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
+      const trailPunct = rm[5] || '';
+      const after = work.slice(matchEnd);
+
+      const openIdx = findOpeningQuoteBefore(work, searchMin, closeStart, closer);
+      let effOpenIdx = openIdx;
+      let missingOpener = false;
+      if (effOpenIdx === -1 && searchMin === 0 && !inlineAcc && !after.trim()) {
+        // Missing opening quote on a full standalone verse line ("...있느니라”(욥12:10).")
+        const cand = work.slice(0, closeStart).trim();
+        const plainCand = cand.replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
+        const looksLikeVerseEnd = /(?:니라|리라|도다|노라|지어다|나이다|소서|으매|로다|더라|아멘|요|다)[.?!]?$/.test(plainCand);
+        if (cand.length >= 8 && (doesTextStartBibleVerse(cand, short, parseInt(ch, 10), parseInt(vs, 10), parseInt(vs, 10), bibleMaps) || looksLikeVerseEnd)) {
+          effOpenIdx = 0;
+          missingOpener = true;
+        }
+      }
+
+      if (effOpenIdx === -1) continue;
+
+      const quoteInner = (missingOpener ? work.slice(0, closeStart) : work.slice(effOpenIdx + 1, closeStart)).trim();
+      if (quoteInner.length < 4) continue;
+
+      // Guard against inline grammatical embedding: `예수님은 “...”(막12:24)라고 하셨다.`
+      const isGrammaticalInline =
+        (!trailPunct && inlineGrammarTailRe.test(after)) ||
+        inlineSpaceGrammarTailRe.test(after) ||
+        (quoteInner.replace(/\*\*|__|~~|<\/?u>/gi, '').trim().length < 6 && /[은는이가을를의로에]$/.test(work.slice(searchMin, effOpenIdx).trim()));
+
+      if (isGrammaticalInline) {
+        inlineAcc += `${work.slice(searchMin, closeStart)}${closer}(${short} ${ch}:${vs})${trailPunct}`;
+        searchMin = matchEnd;
+        continue;
+      }
+
+      const prefixChunk = `${inlineAcc}${work.slice(searchMin, effOpenIdx)}`.trim();
+      inlineAcc = '';
+      if (prefixChunk) {
+        pushSeg(prefixChunk);
+      }
+      pushSeg(`(${short} ${ch}:${vs}) ${quoteInner}`);
+      searchMin = matchEnd;
+    }
+
+    const remTail = `${inlineAcc}${work.slice(searchMin)}`.trim();
+    if (remTail) {
+      // Handle missing closing quote on a standalone line: `“내가 알기에는 ... 초급하구나(욥19:25-27).`
+      const missingCloserM = remTail.match(
+        new RegExp(
+          `^[“"]([^”"\\n]{10,}?)\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\)[.?!]?$`
+        )
+      );
+      if (missingCloserM) {
+        const short = BOOK_FULL_TO_SHORT.get(missingCloserM[2]) || missingCloserM[2];
+        const ch = missingCloserM[3];
+        const vs = missingCloserM[4].replace(/\s+/g, '').replace(/[～~]/g, '-');
+        pushSeg(`(${short} ${ch}:${vs}) ${missingCloserM[1].trim()}`);
+      } else {
+        pushSeg(remTail);
+      }
+    }
+
+    // Step 2: Split glued explanation BEFORE or AFTER `(BOOK chap:verse) verseText` on each resulting segment
+    const stage2Segs = [];
+    for (const seg of stage1Segs) {
+      let curSeg = seg;
+      let guardCount = 0;
+      while (curSeg && guardCount++ < 8) {
+        const curLeadM = curSeg.match(/^([ \t]*(?:(?:-\s+)?(?:>\s+)?|\*\s+))(.*)$/);
+        const curLeadFull = curLeadM ? curLeadM[1] : '';
+        const curBody = curLeadM ? curLeadM[2] : curSeg;
+
+        // 2a) Check if there is explanatory text BEFORE an embedded `(BOOK chap:verse) verseText`
+        let splitBeforeIdx = -1;
+        let scanFrom = 1;
+        while (scanFrom < curBody.length) {
+          const sliceStr = curBody.slice(scanFrom);
+          const em = sliceStr.match(embeddedFrontRefRe);
+          if (!em) break;
+          const relIdx = em.index;
+          const absRefIdx = scanFrom + relIdx;
+          const prefixPart = curBody.slice(0, absRefIdx);
+          const prefixTrim = prefixPart.trim();
+          const bk = em[2];
+          const ch = parseInt(em[3], 10);
+          const vRange = em[4].split(/[-~～]/).map((n) => parseInt(n.trim(), 10));
+          const v1 = vRange[0];
+          const v2 = vRange[1] || v1;
+          const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
+          const afterPart = (em[5] || '').trim();
+
+          const charBefore = absRefIdx > 0 ? curBody[absRefIdx - 1] : ' ';
+          const attachedParenthetical =
+            !/[\s.?!:：”"')\]-]/.test(charBefore) &&
+            /(?:다|요|죠|함|음|됨|임|니라|리라)$/.test(prefixTrim);
+          const afterIsParticle = /^(?:에|에서|의|을|를|이|가|은|는|로|으로|도|만|과|와|참고|참조|비교)(?:\s|$)/.test(afterPart);
+
+          const bibleMatch = !afterIsParticle && afterPart.length >= 6 && doesTextStartBibleVerse(afterPart, short, ch, v1, v2, bibleMaps);
+          const heuristicMatch =
+            !attachedParenthetical &&
+            !afterIsParticle &&
+            afterPart.length >= 8 &&
+            prefixTrim.length >= 4 &&
+            (/[.?!。？！:：”"')\]가-힣]$/.test(prefixTrim) || new RegExp(`^\\(?(?:${BOOK_PATTERN})\\s*\\d`).test(prefixTrim)) &&
+            !/(?:은|는|이|가|을|를|의|에|에서|으로|로|와|과|처럼|같이)$/.test(prefixTrim) &&
+            (/(?:라|다|노라|니라|도다|소서|요|네|까|면|니|고)[.?!]?$|\(\d+\)|\[\d+\]|\d+[가-힣]/.test(afterPart));
+
+          if (prefixTrim.length >= 4 && (bibleMatch || heuristicMatch)) {
+            splitBeforeIdx = absRefIdx;
+            break;
+          }
+          scanFrom = absRefIdx + em[1].length;
+        }
+
+        if (splitBeforeIdx > 0) {
+          const left = `${curLeadFull}${curBody.slice(0, splitBeforeIdx).trimEnd()}`;
+          const right = `${contLead}${curBody.slice(splitBeforeIdx).trimStart()}`;
+          stage2Segs.push(left);
+          curSeg = right;
+          continue;
+        }
+
+        // 2b) Check if current line starts with `(BOOK chap:verse) verseText...` AND has glued commentary AFTER the verse end
+        const leadRefM = curSeg.match(leadVerseLineRe);
+        if (leadRefM) {
+          const vLead = leadRefM[1] || '';
+          const bk = leadRefM[2];
+          const ch = parseInt(leadRefM[3], 10);
+          const vRange = leadRefM[4].split(/[-~～]/).map((n) => parseInt(n.trim(), 10));
+          const v1 = vRange[0];
+          const v2 = vRange[1] || v1;
+          const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
+          const bodyAfterRef = leadRefM[5] || '';
+          const tailSplit = findBibleVerseSplitTailIndex(bodyAfterRef, short, ch, v1, v2, bibleMaps);
+          if (tailSplit > 0) {
+            const verseOnly = bodyAfterRef.slice(0, tailSplit).trimEnd();
+            const commentary = bodyAfterRef.slice(tailSplit).trimStart();
+            const normHeader = `(${short} ${ch}:${vRange.join('-')})`;
+            stage2Segs.push(`${vLead}${normHeader} ${verseOnly}`);
+            curSeg = `${contLead}${commentary}`;
+            continue;
+          }
+        }
+
+        stage2Segs.push(curSeg);
+        break;
+      }
+    }
+
+    for (const s of stage2Segs) {
+      out.push(s);
+    }
+  }
+
+  return out;
+}
+
 function hasUnclosedBoldSpan(prevTrimmed, nextTrimmed) {
   if (!prevTrimmed || /^\*\*\s/.test(prevTrimmed)) return false;
   const boldTokens = prevTrimmed.match(/\*\*/g);
@@ -958,6 +1347,11 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
 
   if (gapCount === 0) {
     if (isQuotePrev && /(?:니라|리라|도다|노라|지어다|나이다|소서|아멘|다|요|라)[.?!]?$/.test(pCore)) return false;
+    if (isQuotePrev) {
+      const nPlain = n.replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
+      if (/(?:다|요|죠|함|음|니다)[.?!]?$/.test(nPlain)) return false;
+      return isDocxHardWrapTail(pCore, n);
+    }
     if (/[.?!。？！"'”’\])…]$/.test(pCore)) return false;
     return pCore.length >= 26 || isDocxHardWrapTail(pCore, n);
   }
@@ -992,6 +1386,11 @@ function mergeBrokenLinesPass(lines, vaultBasePath = '') {
       if (bibleCont) {
         out[out.length - 1] = `${prev.trimEnd()} ${bibleCont.mergedCur}`;
         pendingBlank = false;
+        continue;
+      }
+      if (prev && isBiblePassageCompleteAgainstLookup(prev, cur, bibleMaps)) {
+        if (pendingBlank) { out.push(''); pendingBlank = false; }
+        out.push(cur);
         continue;
       }
       if (prev && shouldMergeProse(prev, cur, gapCount)) {
@@ -2395,6 +2794,9 @@ function refineMarkdownByRules(rawText, options = {}) {
   }
   const isGeneralDoc = opts.docProfile === 'general';
   rawLines = splitInlineNumberedItemsPass(rawLines, isGeneralDoc);
+  if (opts.normalizeBibleRefs) {
+    rawLines = splitAndNormalizeBiblePassagesPass(rawLines, opts);
+  }
   if (opts.mergeBrokenLines) {
     rawLines = mergeBrokenLinesPass(rawLines, opts.vaultBasePath || '');
   }
@@ -2895,8 +3297,11 @@ function refineMarkdownByRules(rawText, options = {}) {
     linesAfterMerge = mergeBrokenLinesPass(processedLines, opts.vaultBasePath || '');
   }
 
-  // Fourth pass: normalize Bible references
-  const verseCleanLines = linesAfterMerge.map((line) => {
+  // Fourth pass: split glued Bible verse/explanation & normalize Bible references
+  const verseSplitLines = opts.normalizeBibleRefs
+    ? splitAndNormalizeBiblePassagesPass(linesAfterMerge, opts)
+    : linesAfterMerge;
+  const verseCleanLines = verseSplitLines.map((line) => {
     if (opts.normalizeBibleRefs && !/^\s*(?:```|~~~)/.test(line)) {
       return normalizeBibleRefsInLine(line, !!opts.quoteStandaloneVerses, !!opts.stripVerseBlockquotes);
     }
@@ -3105,7 +3510,9 @@ ${autoNumNote}
      - **제목/소제목 뒤에 설명 문장이나 성구 인용이 바로 한 줄에 붙어 있으면** (예: \`**3) ... 드러냄** 하나님 불의하다?\`, \`**1. 성령을 받을 때...** "기록된바..."\`) **반드시 줄바꿈으로 제목과 아래 본문을 분리**하십시오.
      - **한 줄 안에 다음 번호가 이어붙은 경우** (예: \`**5. ... 같다.** **6. 교회를...**\`, \`...연약함 **3. 하나님이...**\`) 반드시 각 번호마다 새 문단으로 나누십시오.
      - 문맥상 **제목 역할인 짧은 '1. / 1) / ①'** 은 문서 전체에서 빠뜨리지 말고 일관된 '#' 등급으로 올리고, **긴 서술 문장형 '1. ~다., 2. ~다.'는 제목으로 올리지 말고 일반 번호 문단으로** 두십시오.
-  4. 성경 구절: '(창 47:7-10) 말씀...' 형태로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`
+  4. **성경 구절 정규화 및 설명 분리 (매우 중요)**:
+     - \`"말씀..."(요 18:1-11).\`처럼 본문 뒤에 장절이 붙은 독립 성경 인용은 \`(요 18:1-11) 말씀...\` 형태로 앞장절 표기로 통일하십시오(단, \`예수님은 "너희가..."(막 12:24)라고 하셨다.\`처럼 문장 서술어에 직접 연결된 인용은 문장 안에 유지).
+     - **성경 구절 줄과 구절 앞/뒤에 붙은 설명 문구·다른 성구 인용은 절대 같은 줄에 붙여 두지 말고 반드시 줄바꿈으로 분리**하고, 원문에 없던 '>' 인용 기호를 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`
     : `  3. **번호·대지 기호 중복, \`-.\` 기호 및 공백 누락 방지 (매우 중요)**:
      - '1) 제목', '2) 제목', '1. 제목', '2. 제목' 앞에 **절대 '- '를 붙이지 마십시오** ('- 1) ...' ❌ → '1) ...' 또는 '\\t1) ...' ⭕, 제목이면 '## 1) ...'). '- 1)'로 쓰면 뷰어에서 '✓ 1)'처럼 대지 기호와 번호가 겹쳐 나옵니다.
      - 반대로 사용자가 직접 지정한 \`✓ 1. ...\`, \`✓ 1) ...\`(숫자 대지 기호) 줄은 '✓ '를 지우거나 제목(#)으로 바꾸지 말고 원형 그대로 유지하십시오.
@@ -3120,7 +3527,9 @@ ${autoNumNote}
      - 문서 상단에서 \`(1) ...\`, \`(2) ...\`, \`(3) ...\`이나 \`A. ...\`, \`B. ...\`, \`a. ...\`이 각각 \`###\`, \`####\`, \`#####\` 제목으로 올라갔다면, 문서 하단 다른 대지(\`## 2.\`) 아래에 \`- (1) ...\`, \`- (2) ...\`처럼 불릿이 잘못 붙어 있더라도 절대 본문 목록으로 두지 말고 똑같이 \`### (1) ...\`, \`### (2) ...\` 제목으로 통일하십시오.
      - **원문자(①, ②, ③...) 제목 승격**: \`①, ②, ③...\` 원문자 숫자는 본문이나 일반 목록(\`- ①\`)으로 두지 말고, 바로 위에 있는 상위 제목(\`#\`, \`##\`, \`###\` 등)을 찾아 반드시 그 한 단계 아래 제목(\`## ①\`, \`### ①\`, \`#### ①\` 등)으로 승격시키십시오.
      - 상위 번호(예: ⑪)가 목록인데 하위 항목(가., 나.)만 제목(####)으로 뒤집히지 않게 일관성을 유지하십시오.
-  6. 성경 구절: '(창 47:7-10) 말씀...' 형태(목록 내부라면 '\\t- (창 26:1) 말씀...')로 통일하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`;
+  6. **성경 구절 정규화 및 설명 분리 (매우 중요)**:
+     - \`"말씀..."(창 1:1).\`처럼 뒤에 장절이 붙은 독립 성경 인용은 \`(창 1:1) 말씀...\`(목록 내부라면 \`\\t- (창 1:1) 말씀...\`) 앞장절 표기로 통일하십시오(단, \`...라고 하셨다.\`처럼 문장 서술어에 직접 붙는 인용은 문장 내 유지).
+     - **성경 구절과 설명 문구가 같은 줄에 붙어 있으면 반드시 줄바꿈으로 분리**하고, 원문에 없던 '>' 인용 기호를 절대 새로 붙이지 마십시오. 구절 괄호 뒤에는 띄어쓰기 1칸을 둡니다.`;
 
   return `${commonRules}${profileNote}
 ${globalPlanBlock}${prevContextBlock}
@@ -3750,6 +4159,9 @@ class SermonMdRefinerPlugin extends Plugin {
         cleanBody.split('\n').map((l) => l.replace(/[ \t]+$/g, '')),
         effectiveDocProfile === 'general'
       );
+      if (effectiveRuleOpts.normalizeBibleRefs !== false) {
+        prepLines = splitAndNormalizeBiblePassagesPass(prepLines, effectiveRuleOpts);
+      }
       cleanBody = mergeBrokenLinesPass(prepLines, effectiveRuleOpts.vaultBasePath || '').join('\n');
     }
     cleanBody = convertPandocUnderlineTags(cleanBody);
@@ -3825,6 +4237,9 @@ class SermonMdRefinerPlugin extends Plugin {
           postLines = mergeBrokenLinesPass(postLines, effectiveRuleOpts.vaultBasePath || '');
         }
         postLines = convertPandocUnderlineTags(postLines.join('\n')).split('\n');
+        if (effectiveRuleOpts.normalizeBibleRefs !== false) {
+          postLines = splitAndNormalizeBiblePassagesPass(postLines, effectiveRuleOpts);
+        }
         postLines = postLines.map((l) => (
           effectiveRuleOpts.normalizeBibleRefs !== false
             ? normalizeBibleRefsInLine(l, !!effectiveRuleOpts.quoteStandaloneVerses, effectiveStripQuotes)
