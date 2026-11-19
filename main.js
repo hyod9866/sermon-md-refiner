@@ -46,6 +46,7 @@ const DEFAULT_SETTINGS = {
   geminiApiKeys: '',
   useMindmapGeminiKey: true,
   geminiModel: 'gemini-2.5-flash',
+  useGeminiAi: false,
   defaultMode: 'ai_struct', // 통합 단일 모드
   docProfile: 'sermon', // 'sermon' (내 설교문 양식) | 'general' (일반 문서/원고)
   headingLevelScope: 'h1_h6', // 'h1_h6' | 'h1_h3' | 'h1_h2'
@@ -3682,6 +3683,7 @@ class SermonMdRefineModal extends Modal {
       quoteStandaloneVerses: !!plugin.settings.quoteStandaloneVerses,
       stripVerseBlockquotes: !!plugin.settings.stripVerseBlockquotes,
       addMissingFrontmatter: !!plugin.settings.addMissingFrontmatter,
+      useGeminiAi: !!plugin.settings.useGeminiAi,
       useSelectionOnly: !!(targetContext.selectionText && targetContext.selectionText.trim().length > 0)
     };
     this.isBusy = false;
@@ -3735,12 +3737,17 @@ class SermonMdRefineModal extends Modal {
 
     // Rule options box
     const optBox = contentEl.createDiv({ cls: 'smr-options-box' });
-    const addOpt = (key, labelText) => {
+    let customRow = null;
+    const syncAiNoteRow = () => {
+      if (customRow) customRow.style.display = this.opts.useGeminiAi ? 'block' : 'none';
+    };
+    const addOpt = (key, labelText, onToggle = null) => {
       const lbl = optBox.createEl('label', { cls: 'smr-opt-label' });
       const cb = lbl.createEl('input', { type: 'checkbox' });
       cb.checked = !!this.opts[key];
       cb.onchange = () => {
         this.opts[key] = cb.checked;
+        if (onToggle) onToggle(cb.checked);
       };
       lbl.createSpan({ text: labelText });
     };
@@ -3751,6 +3758,7 @@ class SermonMdRefineModal extends Modal {
     addOpt('stripVerseBlockquotes', '성구 줄 앞 > 인용구 제거');
     addOpt('addMissingFrontmatter', '상단 강사/장소 → YAML 머리말');
     if (this.ctx.selectionText) addOpt('useSelectionOnly', '드래그로 선택한 영역만 다듬기');
+    addOpt('useGeminiAi', '🤖 Gemini AI 맞춤법·구조화 함께 실행 (선택)', syncAiNoteRow);
     optBox.style.display = 'grid';
 
     const scopeWrap = contentEl.createDiv({ cls: 'smr-opt-select-row' });
@@ -3785,15 +3793,15 @@ class SermonMdRefineModal extends Modal {
     };
     numWrap.style.display = 'flex';
 
-    // Custom AI note
-    const customRow = contentEl.createDiv({ cls: 'smr-custom-note-row' });
+    // Custom AI note (shown when Gemini AI option is checked)
+    customRow = contentEl.createDiv({ cls: 'smr-custom-note-row' });
     const customInput = customRow.createEl('input', {
       cls: 'smr-custom-note-input',
       type: 'text',
       placeholder: 'AI 추가 지시 (선택, 예: 서론/본론 1,2,3으로 나눠줘 / 한문 병기 유지)'
     });
     customInput.value = this.plugin.settings.customPromptNote || '';
-    customRow.style.display = 'block';
+    syncAiNoteRow();
 
     const getSourceText = () => (this.opts.useSelectionOnly && this.ctx.selectionText ? this.ctx.selectionText : this.ctx.fullText);
 
@@ -3818,13 +3826,24 @@ class SermonMdRefineModal extends Modal {
 
     const runDirectRefine = async () => {
       const src = getSourceText();
-      this.plugin.settings.customPromptNote = customInput.value.trim();
-      await this.plugin.saveSettings();
+      if (this.opts.useGeminiAi) {
+        this.plugin.settings.customPromptNote = customInput.value.trim();
+        await this.plugin.saveSettings();
+      }
+
+      const ruleRunOpts = Object.assign({}, this.opts, {
+        vaultBasePath: this.app?.vault?.adapter?.basePath || ''
+      });
+
+      if (!this.opts.useGeminiAi) {
+        statusLine.setText('⚡ 기존 규칙 로직으로 즉시 정리 중...');
+        return refineMarkdownByRules(src, ruleRunOpts);
+      }
 
       const keys = this.plugin.collectGeminiKeys();
       if (!keys.length) {
         statusLine.setText('⚡ Gemini API 키가 없어 규칙 정리(줄바꿈·계층·성구)를 실행합니다...');
-        return refineMarkdownByRules(src, this.opts);
+        return refineMarkdownByRules(src, ruleRunOpts);
       }
 
       this.abortController = new AbortController();
@@ -3966,6 +3985,14 @@ class SermonMdRefinerSettingTab extends PluginSettingTab {
       }));
 
     containerEl.createEl('h3', { text: 'AI 정리 (Gemini API)' });
+
+    new Setting(containerEl)
+      .setName('기본적으로 Gemini AI 정리 사용')
+      .setDesc('끄면(권장) 기존의 빠른 로컬 규칙 로직으로 즉시 정리하고, 정리 창에서 "🤖 Gemini AI 함께 실행"을 체크했을 때만 AI를 호출합니다.')
+      .addToggle((t) => t.setValue(!!s.useGeminiAi).onChange(async (v) => {
+        s.useGeminiAi = v;
+        await this.plugin.saveSettings();
+      }));
 
     new Setting(containerEl)
       .setName('설교 마인드맵 플러그인의 Gemini 키 자동 연동')
