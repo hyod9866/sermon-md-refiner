@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS = {
   geminiApiKeys: '',
   useMindmapGeminiKey: true,
   geminiModel: 'gemini-2.5-flash',
-  defaultMode: 'ai_proof', // 'ai_proof' | 'ai_struct'
+  defaultMode: 'ai_struct', // 통합 단일 모드
   docProfile: 'sermon', // 'sermon' (내 설교문 양식) | 'general' (일반 문서/원고)
   headingLevelScope: 'h1_h6', // 'h1_h6' | 'h1_h3' | 'h1_h2'
   autoNumberedStyle: 'smart', // 'smart' | 'to_bullet' | 'keep'
@@ -3670,7 +3670,7 @@ class SermonMdRefineModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.ctx = targetContext; // { file, editor, selectionText, fullText }
-    this.mode = plugin.settings.defaultMode === 'ai_struct' ? 'ai_struct' : 'ai_proof';
+    this.mode = 'ai_struct';
     this.opts = {
       docProfile: plugin.settings.docProfile || 'sermon',
       headingLevelScope: plugin.settings.headingLevelScope || 'h1_h6',
@@ -3733,33 +3733,7 @@ class SermonMdRefineModal extends Modal {
     };
     syncProfileUi();
 
-    // Mode cards (규칙 · AI 맞춤법, 구조화 정리 통합 + 전체 편집)
-    const modeGroup = contentEl.createDiv({ cls: 'smr-mode-group' });
-    const modes = [
-      { id: 'ai_proof', title: '🤖 규칙 · AI 맞춤법, 구조화 정리', tooltip: '규칙 정리(줄바꿈·계층·성구) + AI 맞춤법·구조화 정리 통합 실행 (AI 키 미설정 시 규칙 정리 자동 실행)' },
-      { id: 'ai_struct', title: '✨ 전체 편집', tooltip: '규칙 정리 + AI 전체 통독·계층 설계 + 전체 문서 2차 규칙 검수 일괄 실행' }
-    ];
-    const modeButtons = [];
-    const syncModeVisibility = () => {
-      customRow.style.display = 'block';
-      optBox.style.display = 'grid';
-      scopeWrap.style.display = 'flex';
-      numWrap.style.display = 'flex';
-    };
-    for (const m of modes) {
-      const btn = modeGroup.createEl('button', { cls: 'smr-mode-btn', type: 'button' });
-      btn.title = m.tooltip;
-      btn.createDiv({ cls: 'smr-mode-title', text: m.title });
-      if (this.mode === m.id) btn.addClass('is-active');
-      btn.onclick = () => {
-        this.mode = m.id;
-        modeButtons.forEach((b, idx) => b.toggleClass('is-active', modes[idx].id === m.id));
-        syncModeVisibility();
-      };
-      modeButtons.push(btn);
-    }
-
-    // Rule options box (visible across both modes)
+    // Rule options box
     const optBox = contentEl.createDiv({ cls: 'smr-options-box' });
     const addOpt = (key, labelText) => {
       const lbl = optBox.createEl('label', { cls: 'smr-opt-label' });
@@ -3824,7 +3798,7 @@ class SermonMdRefineModal extends Modal {
     const getSourceText = () => (this.opts.useSelectionOnly && this.ctx.selectionText ? this.ctx.selectionText : this.ctx.fullText);
 
     // Status + Footer execute/apply buttons (no preview needed)
-    const statusLine = contentEl.createDiv({ cls: 'smr-status-line', text: '원하는 옵션과 모드를 선택한 뒤 아래 적용 버튼을 누르면 즉시 노트를 정리합니다.' });
+    const statusLine = contentEl.createDiv({ cls: 'smr-status-line', text: '원하는 문서 양식과 옵션을 확인한 뒤 아래 적용 버튼을 누르면 즉시 노트를 정리합니다.' });
     const footer = contentEl.createDiv({ cls: 'smr-footer-row' });
     const stopBtn = footer.createEl('button', { text: '중단' });
     stopBtn.style.display = 'none';
@@ -3945,14 +3919,6 @@ class SermonMdRefinerSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
 
     containerEl.createEl('h2', { text: '노트 서식 다듬기 설정' });
-
-    new Setting(containerEl)
-      .setName('기본 정리 모드')
-      .addDropdown((d) => d
-        .addOption('ai_proof', '🤖 규칙 · AI 맞춤법, 구조화 정리 (권장)')
-        .addOption('ai_struct', '✨ 전체 편집 (규칙 + AI + 2차 심층 검수)')
-        .setValue(s.defaultMode === 'ai_struct' ? 'ai_struct' : 'ai_proof')
-        .onChange(async (v) => { s.defaultMode = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName('기본 문서 양식')
@@ -4099,9 +4065,7 @@ class SermonMdRefinerPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    if (!this.settings.defaultMode || this.settings.defaultMode === 'rules') {
-      this.settings.defaultMode = 'ai_proof';
-    }
+    this.settings.defaultMode = 'ai_struct';
     this.settings.quoteStandaloneVerses = false;
   }
 
@@ -4152,17 +4116,19 @@ class SermonMdRefinerPlugin extends Plugin {
     return Array.from(new Set(keys));
   }
 
-  async callGeminiChunk(prompt, keys, abortSignal) {
+  async callGeminiChunk(prompt, keys, abortSignal, reqOpts = {}) {
     const models = Array.from(new Set([
       this.settings.geminiModel || 'gemini-2.5-flash',
       'gemini-2.5-flash',
       'gemini-2.5-flash-lite',
       'gemini-3-flash-preview'
     ]));
+    const keyOffset = Number.isFinite(reqOpts.keyOffset) ? reqOpts.keyOffset : 0;
 
     let lastErr = null;
     for (const model of models) {
-      for (const key of keys) {
+      for (let ki = 0; ki < keys.length; ki++) {
+        const key = keys[(ki + keyOffset) % keys.length];
         if (abortSignal && abortSignal.aborted) {
           const ae = new Error('Aborted');
           ae.name = 'AbortError';
@@ -4170,13 +4136,21 @@ class SermonMdRefinerPlugin extends Plugin {
         }
         try {
           const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+          const generationConfig = {
+            temperature: 0.1,
+            maxOutputTokens: reqOpts.maxOutputTokens || 65536
+          };
+          if (model.startsWith('gemini-2.5-')) {
+            // Turn off default thinking tokens to eliminate 10-40s latency overhead per chunk
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
           const res = await requestUrl({
             url,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 65536 }
+              generationConfig
             }),
             throw: false
           });
@@ -4248,21 +4222,21 @@ class SermonMdRefinerPlugin extends Plugin {
     }
     cleanBody = convertPandocUnderlineTags(cleanBody);
 
-    // Use larger semantic chunks (11,000 chars) so whole sections stay intact; for multi-chunk or long docs, design full H1~H6 map first
+    // Use larger semantic chunks (11,000 chars); only run separate whole-doc outline pass when split across multiple chunks
     const chunks = splitIntoChunks(cleanBody, 11000);
     let globalOutlinePlan = '';
-    if (chunks.length > 1 || cleanBody.length > 6000) {
+    if (chunks.length > 1) {
       if (abortSignal && abortSignal.aborted) {
         const ae = new Error('Aborted');
         ae.name = 'AbortError';
         throw ae;
       }
       if (onProgress) {
-        onProgress('🧭 전체 문서 내용 통독 및 제목1(대지)~제목6 하이어라키 설계 중...');
+        onProgress('🧭 전체 문서 목차(제목1~6) 계층 설계 중...');
       }
       try {
         const planPrompt = buildGlobalOutlinePlanPrompt(cleanBody, effectiveScope, customNote, effectiveDocProfile);
-        const rawPlan = await this.callGeminiChunk(planPrompt, keys, abortSignal);
+        const rawPlan = await this.callGeminiChunk(planPrompt, keys, abortSignal, { maxOutputTokens: 4096 });
         const planLines = rawPlan.split('\n').map((l) => l.trim()).filter((l) => /^#{1,6}\s+/.test(l));
         if (planLines.length > 0) {
           globalOutlinePlan = planLines.join('\n');
@@ -4273,26 +4247,53 @@ class SermonMdRefinerPlugin extends Plugin {
       }
     }
 
-    const outChunks = [];
-    for (let i = 0; i < chunks.length; i++) {
+    const outChunks = new Array(chunks.length);
+    const effectiveMode = mode || 'ai_struct';
+    if (chunks.length <= 1) {
       if (abortSignal && abortSignal.aborted) {
         const ae = new Error('Aborted');
         ae.name = 'AbortError';
         throw ae;
       }
       if (onProgress) {
-        const stage = mode === 'ai_struct' ? '✨ [전체 편집]' : '🤖 [규칙 · AI 맞춤법·구조화]';
-        onProgress(`${stage} 본문 다듬기 및 하이어라키 적용 중 (${i + 1} / ${chunks.length} 구간)...`);
+        onProgress('✨ AI 맞춤법·구조화 정리 중...');
       }
-      const prevTail = i > 0 && outChunks[i - 1]
-        ? outChunks[i - 1].slice(-420)
-        : '';
-      const prompt = buildAiPrompt(mode, chunks[i], customNote, effectiveScope, effectiveNumStyle, {
-        globalOutlinePlan,
-        prevTail
+      const prompt = buildAiPrompt(effectiveMode, chunks[0] || '', customNote, effectiveScope, effectiveNumStyle, {
+        globalOutlinePlan: '',
+        prevTail: ''
       }, effectiveDocProfile);
-      const refined = await this.callGeminiChunk(prompt, keys, abortSignal);
-      outChunks.push(refined);
+      outChunks[0] = await this.callGeminiChunk(prompt, keys, abortSignal);
+    } else {
+      let nextIdx = 0;
+      let doneCount = 0;
+      const concurrency = Math.min(keys.length > 1 ? 3 : 2, chunks.length);
+      if (onProgress) {
+        onProgress(`✨ 본문 다듬기 및 하이어라키 병렬 적용 중 (0 / ${chunks.length} 구간)...`);
+      }
+      const runWorker = async () => {
+        while (true) {
+          const i = nextIdx++;
+          if (i >= chunks.length) return;
+          if (abortSignal && abortSignal.aborted) {
+            const ae = new Error('Aborted');
+            ae.name = 'AbortError';
+            throw ae;
+          }
+          const prevTail = i > 0 && chunks[i - 1]
+            ? chunks[i - 1].slice(-300)
+            : '';
+          const prompt = buildAiPrompt(effectiveMode, chunks[i], customNote, effectiveScope, effectiveNumStyle, {
+            globalOutlinePlan,
+            prevTail
+          }, effectiveDocProfile);
+          outChunks[i] = await this.callGeminiChunk(prompt, keys, abortSignal, { keyOffset: i });
+          doneCount++;
+          if (onProgress) {
+            onProgress(`✨ 본문 다듬기 및 하이어라키 병렬 적용 중 (${doneCount} / ${chunks.length} 구간)...`);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
     }
 
     const hasCustomNote = Boolean(customNote && customNote.trim());
