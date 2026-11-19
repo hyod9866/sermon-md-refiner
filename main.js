@@ -140,6 +140,19 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
   const leading = line.match(/^[ \t]*/)[0];
   let rest = line.slice(leading.length);
 
+  // Correct common STT/OCR proper noun typo ("아리스다교" -> "아리스다고")
+  if (rest.includes('아리스다교')) {
+    rest = rest.replace(/아리스다교/g, '아리스다고');
+  }
+
+  // Normalize underscore between verse range numbers anywhere after a Bible book + chap:verse
+  // e.g. "행 18:1_4", "행 18:1\_4", "(빌3:13_14)" -> "행 18:1-4", "(빌3:13-14)" (without touching filenames like "44 행 18_1-17")
+  const underscoreVerseRangeRe = new RegExp(
+    `(${BOOK_PATTERN})(\\s*\\(?\\s*\\d{1,3}\\s*[:：]\\s*\\d{1,3})\\s*(?:\\\\?[_＿])\\s*(\\d{1,3})`,
+    'g'
+  );
+  rest = rest.replace(underscoreVerseRangeRe, '$1$2-$3');
+
   // Optionally strip blockquote '>' before standalone Bible verse line (including '- > (창 1:1)' or '\t- > ...')
   if (stripVerseQuotes) {
     const bulletGt = rest.match(/^([-*+]\s+)?(>\s*)(.*)$/);
@@ -156,22 +169,22 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
 
   // "잠언(9:8)" / "삼하(16:7-10)" -> "(잠 9:8)" / "(삼하 16:7-10)"
   const splitBookParenRe = new RegExp(
-    `(${BOOK_PATTERN})\\s*\\(\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\)`,
+    `(${BOOK_PATTERN})\\s*\\(\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*\\)`,
     'g'
   );
   rest = rest.replace(splitBookParenRe, (_, bk, ch, vs) => {
     const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
-    return `(${short} ${ch}:${vs.replace(/\s+/g, '').replace(/[～~]/g, '-')})`;
+    return `(${short} ${ch}:${vs.replace(/\\_/g, '-').replace(/\s+/g, '').replace(/[～~_＿]/g, '-')})`;
   });
 
   // "(잠언27:5)" / "(고후 5:9~10)" -> "(잠 27:5)" / "(고후 5:9-10)"
   const parenBookRe = new RegExp(
-    `\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\)`,
+    `\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*\\)`,
     'g'
   );
   rest = rest.replace(parenBookRe, (_, bk, ch, vs) => {
     const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
-    return `(${short} ${ch}:${vs.replace(/\s+/g, '').replace(/[～~]/g, '-')})`;
+    return `(${short} ${ch}:${vs.replace(/\\_/g, '-').replace(/\s+/g, '').replace(/[～~_＿]/g, '-')})`;
   });
 
   // Ensure a space after normalized Bible ref when immediately followed by verse/word: "(눅 9:51)예수께서" -> "(눅 9:51) 예수께서"
@@ -184,11 +197,11 @@ function normalizeBibleRefsInLine(line, quoteStandalone = false, stripVerseQuote
 
   // "[마 16:16] 본문" or "- [마 16:16] 본문" -> "(마 16:16) 본문" (only at start/list-start followed by verse body, preserving [키워드] brackets)
   const bracketVerseRe = new RegExp(
-    `^((?:[-*+]\\s+)?)\\[\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\](\\s+\\S.*)$`
+    `^((?:[-*+]\\s+)?)\\[\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*\\](\\s+\\S.*)$`
   );
   rest = rest.replace(bracketVerseRe, (_, bulletPrefix, bk, ch, vs, tail) => {
     const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
-    return `${bulletPrefix || ''}(${short} ${ch}:${vs.replace(/\s+/g, '').replace(/[～~]/g, '-')})${tail}`;
+    return `${bulletPrefix || ''}(${short} ${ch}:${vs.replace(/\\_/g, '-').replace(/\s+/g, '').replace(/[～~_＿]/g, '-')})${tail}`;
   });
 
   // Standalone quoted verse with trailing ref: '“말씀...”(요 18:1-11).' -> '(요 18:1-11) 말씀...'
@@ -205,7 +218,7 @@ function normalizeStandaloneQuotedBibleRef(restText) {
   const body = listM[2].trim();
   const m = body.match(
     new RegExp(
-      `^[“"]([^\\n]{6,}?)[”"“]{1,2}\\s*\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*\\)[.?!]?$`
+      `^[“"]([^\\n]{6,}?)[”"“]{1,2}\\s*\\(\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*\\)[.?!]?$`
     )
   );
   if (m) {
@@ -215,7 +228,7 @@ function normalizeStandaloneQuotedBibleRef(restText) {
     if (!earlierClosing) {
       const short = BOOK_FULL_TO_SHORT.get(m[2]) || m[2];
       const ch = m[3];
-      const vs = m[4].replace(/\s+/g, '').replace(/[～~]/g, '-');
+      const vs = m[4].replace(/\\_/g, '-').replace(/\s+/g, '').replace(/[～~_＿]/g, '-');
       return `${prefix}(${short} ${ch}:${vs}) ${inner}`;
     }
   }
@@ -1085,14 +1098,14 @@ function splitAndNormalizeBiblePassagesPass(lines, opts = {}, bibleMapsInput = n
   const bibleMaps = Array.isArray(bibleMapsInput) ? bibleMapsInput : getBibleVerseLookup(opts.vaultBasePath || '');
   const isGeneralDoc = opts.docProfile === 'general';
   const trailingQuoteRefRe = new RegExp(
-    `([”"“]{1,2})\\s*[(\\[]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[)\\]]([.?!]?)`,
+    `([”"“]{1,2})\\s*[(\\[]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*[)\\]]([.?!]?)`,
     'g'
   );
   const embeddedFrontRefRe = new RegExp(
-    `((?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?)\\s+(.+)$`
+    `((?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?)\\s+(.+)$`
   );
   const leadVerseLineRe = new RegExp(
-    `^([ \\t]*(?:[-*+]\\s+)?(?:>\\s+)?)(?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*[-~～]\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?\\s+(.+)$`
+    `^([ \\t]*(?:[-*+]\\s+)?(?:>\\s+)?)(?:\\*\\*|__)?[\\[(]\\s*(${BOOK_PATTERN})\\s*(\\d{1,3})\\s*[:：]\\s*(\\d{1,3}(?:\\s*(?:[-~～_＿]|\\\\_)\\s*\\d{1,3})?)\\s*[\\])](?:\\*\\*|__)?\\s+(.+)$`
   );
   const inlineGrammarTailRe = /^(?:이?(?:라고|고(?:\s|$|[,.?!])|라며|이라는|라는|란|하[고며여셨습니]|말씀하)|(?:을|를|은|는|이|가|에|에서|으로|로|와|과|의|도|만|처럼|같이)(?=\s|$|[,.?!]))/;
   const inlineSpaceGrammarTailRe = /^\s*(?:라고|이라고|하[셨고며습]|말씀하[셨고])/;
@@ -1147,7 +1160,7 @@ function splitAndNormalizeBiblePassagesPass(lines, opts = {}, bibleMapsInput = n
       const matchEnd = rm.index + rm[0].length;
       const bk = rm[2];
       const ch = rm[3];
-      const vs = rm[4].replace(/\s+/g, '').replace(/[～~]/g, '-');
+      const vs = rm[4].replace(/\\_/g, '-').replace(/\s+/g, '').replace(/[～~_＿]/g, '-');
       const short = BOOK_FULL_TO_SHORT.get(bk) || bk;
       const trailPunct = rm[5] || '';
       const after = work.slice(matchEnd);
@@ -3607,7 +3620,7 @@ ${autoNumNote}
 
   const modeLead = mode === 'ai_struct'
     ? `[이번 작업: 전체 편집 (전체 문맥 기반 AI 맞춤법·오타 교정 + 제목1('# ')부터 일관된 하이어라키 구조화)]
-- 먼저 내용 전체의 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악하고, 붙은 띄어쓰기('대한정확한이해를하고' → '대한 정확한 이해를 하고')·복붙 오타('말음'→'마음', '받향'→'방향')·HTML 잔재(&#8228;→·)·끊긴 줄바꿈과 문단을 깔끔히 교정·구조화하십시오:`
+- 먼저 내용 전체의 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악하고, 붙은 띄어쓰기('대한정확한이해를하고' → '대한 정확한 이해를 하고')·복붙/STT 오타('말음'→'마음', '받향'→'방향', '아리스다교'→'아리스다고')·성경 장절 오기('행 18:1_4' → '행 18:1-4')·HTML 잔재(&#8228;→·)·끊긴 줄바꿈과 문단을 깔끔히 교정·구조화하십시오:`
     : `[이번 작업: AI 맞춤법, 구조화 정리]
 - 전체 내용의 논리 흐름(대지 '# ' → 중지 '## ' → 소지 '### ' → 세부 '####'~'######')을 파악해 제목1('# ')부터 일관되게 계층을 잡으면서, 붙은 띄어쓰기·복붙 오타·끊긴 줄바꿈과 문단을 교정·구조화하십시오:`;
 
