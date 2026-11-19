@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS = {
   geminiApiKeys: '',
   useMindmapGeminiKey: true,
   geminiModel: 'gemini-2.5-flash',
-  defaultMode: 'rules', // 'rules' | 'ai_proof' | 'ai_struct'
+  defaultMode: 'ai_proof', // 'ai_proof' | 'ai_struct'
   docProfile: 'sermon', // 'sermon' (내 설교문 양식) | 'general' (일반 문서/원고)
   headingLevelScope: 'h1_h6', // 'h1_h6' | 'h1_h3' | 'h1_h2'
   autoNumberedStyle: 'smart', // 'smart' | 'to_bullet' | 'keep'
@@ -465,6 +465,26 @@ function splitInlineNumberedItemsPass(lines, isGeneralDoc = false) {
       const dashParts = work.split('\n');
       for (const dp of dashParts) {
         if (dp.trim()) lines_pushSplitInlineNums(dp, out);
+      }
+      continue;
+    }
+
+    // 1b) Split inline HWP asterisk bullets ("...한다. *  1)그리스도인들은... *  다음...")
+    // CommonMark never allows `*` + 2 spaces as emphasis, so inline `*\s{2,}` is strictly a pasted HWP bullet
+    if (/\S\s*\*\s{2,}(?=[가-힣A-Za-z0-9“‘"'(\[])/.test(line)) {
+      const leadWs = line.match(/^[ \t]*/)[0];
+      const prefix = `${leadWs}${isGeneralDoc ? '' : '- '}`;
+      const splitAst = line
+        .replace(/([^\s*])\s*\*\s{2,}(?=[가-힣A-Za-z0-9“‘"'(\[])/g, (m, prevCh) => `${prevCh}\n${prefix}`)
+        .replace(/^([ \t]*)\*\s{2,}/, `${leadWs}${isGeneralDoc ? '' : '- '}`);
+      const astParts = splitAst.split('\n');
+      for (let apIdx = 0; apIdx < astParts.length; apIdx++) {
+        let ap = astParts[apIdx].trimEnd();
+        // Clean stray unmatched HWP asterisk left at bullet boundary
+        if ((ap.match(/\*/g) || []).length % 2 === 1 && /\*\s*$/.test(ap)) {
+          ap = ap.replace(/\s*\*\s*$/, '').trimEnd();
+        }
+        if (ap.trim()) lines_pushSplitInlineNums(ap, out);
       }
       continue;
     }
@@ -1393,7 +1413,8 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
     return pCore.length >= 26 || isDocxHardWrapTail(pCore, n);
   }
 
-  // Across a single blank line (gapCount === 1): strictly merge only unmistakable broken mid-sentence wraps
+  // Across a single blank line (gapCount === 1): never merge a completed standalone Bible verse into following prose
+  if (isQuotePrev) return false;
   return isDocxHardWrapTail(pCore, n);
 }
 
@@ -1680,9 +1701,18 @@ function formatReconcileListLine(indentUnit, depth, body, orderedMarker) {
 }
 
 function stepBulletIndentStack(bulletStack, tag, tabDepth, allowOuterReset) {
+  const isNestedOrdinalRestart =
+    tag.ordinal === 1 &&
+    bulletStack.length > 0 &&
+    tabDepth > bulletStack[bulletStack.length - 1].tabDepth;
   let sameFamIdx = -1;
-  for (let k = bulletStack.length - 1; k >= 0; k--) {
-    if (bulletStack[k].family === tag.family) { sameFamIdx = k; break; }
+  if (!isNestedOrdinalRestart) {
+    for (let k = bulletStack.length - 1; k >= 0; k--) {
+      if (bulletStack[k].family === tag.family && (tabDepth >= bulletStack[k].tabDepth || k === 0)) {
+        sameFamIdx = k;
+        break;
+      }
+    }
   }
   let newDepth = tabDepth;
   if (sameFamIdx !== -1) {
@@ -1696,7 +1726,7 @@ function stepBulletIndentStack(bulletStack, tag, tabDepth, allowOuterReset) {
     }
   } else if (bulletStack.length > 0) {
     const top = bulletStack[bulletStack.length - 1];
-    if (tag.rank > top.rank || (tag.ordinal === 1 && tag.family !== top.family)) {
+    if (isNestedOrdinalRestart || tag.rank > top.rank || (tag.ordinal === 1 && tag.family !== top.family)) {
       newDepth = Math.max(tabDepth, top.tabDepth + 1);
       bulletStack.push({ tabDepth: newDepth, rank: tag.rank, family: tag.family });
     } else {
@@ -3087,7 +3117,11 @@ function refineMarkdownByRules(rawText, options = {}) {
           hasDocHalfParenSub ||
           (info.title || '').replace(/\*\*|__|~~|<\/?u>/gi, '').trim().length <= 42
         );
-      if (allowPromote && canPromoteNumCandidate) {
+      const hasImmediateTabChildInSermon =
+        !isGeneralDoc &&
+        i + 1 < rawLines.length &&
+        /^\t+(?:-\s+|\d+[.)]\s+)/.test(rawLines[i + 1]);
+      if (allowPromote && canPromoteNumCandidate && !hasImmediateTabChildInSermon) {
         const plainTitle = (info.title || '').replace(/\*\*|__|~~|<\/?u>/gi, '').trim();
         const isOrphanLongNum1 = info.numVal === 1 && plainTitle.length > 42 && !hasOrderedSibling(i, 0);
         if (!isOrphanLongNum1) {
@@ -3116,7 +3150,8 @@ function refineMarkdownByRules(rawText, options = {}) {
           (isCapAlpha && hasCapAlphaSeries && info.body.length <= 36 && !/[?!]/.test(info.body) && (info.body.match(/,/g) || []).length < 2);
         const isHalfParenSub = isHalfParenMarker && effCanBeHeading;
         const isFullParenSub = info.indent === 0 && /^\(\d{1,2}\)$/.test(info.marker || '') && effCanBeHeading;
-        const allowFromBullet = !info.fromBullet || (hasExplicitFullParenHeading && !/[.?!다요죠함음]$/.test(info.body));
+        const fromAiBulletParen = !!(opts.fromAiPass && isFullParenSub && /^\s*[-*+]\s+\(\d{1,2}\)\s/.test(line) && !hasExplicitFullParenHeading);
+        const allowFromBullet = (!info.fromBullet && !fromAiBulletParen) || (hasExplicitFullParenHeading && !/[.?!다요죠함음]$/.test(info.body));
         const inActiveSiblingList =
           !isCircledSub &&
           indentStack.some((w) => w <= info.indent) &&
@@ -3378,11 +3413,19 @@ function refineMarkdownByRules(rawText, options = {}) {
   let joined = finalLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   const rawHead = frontmatter || generatedFm;
   const head = applyDocProfileFrontmatter(rawHead, isGeneralDoc, !!opts.useSelectionOnly);
+  let outText = joined ? joined + '\n' : '';
   if (head) {
     const cleanHead = head.endsWith('\n') ? head : head + '\n';
-    return cleanHead + (joined ? joined + '\n' : '');
+    outText = cleanHead + outText;
   }
-  return joined ? joined + '\n' : '';
+  // Guarantee 1-click idempotency: converge if post-Pass-1 splits/unwraps exposed new headings or blank-line boundaries
+  if (!opts._isConvergencePass && !opts.respectAiHeadings && outText !== String(rawText || '')) {
+    return refineMarkdownByRules(outText, Object.assign({}, opts, {
+      addMissingFrontmatter: false,
+      _isConvergencePass: true
+    }));
+  }
+  return outText;
 }
 
 function splitLongLineForChunking(line, maxChars) {
@@ -3614,7 +3657,7 @@ class SermonMdRefineModal extends Modal {
     super(app);
     this.plugin = plugin;
     this.ctx = targetContext; // { file, editor, selectionText, fullText }
-    this.mode = plugin.settings.defaultMode || 'rules';
+    this.mode = plugin.settings.defaultMode === 'ai_struct' ? 'ai_struct' : 'ai_proof';
     this.opts = {
       docProfile: plugin.settings.docProfile || 'sermon',
       headingLevelScope: plugin.settings.headingLevelScope || 'h1_h6',
@@ -3628,7 +3671,6 @@ class SermonMdRefineModal extends Modal {
       addMissingFrontmatter: !!plugin.settings.addMissingFrontmatter,
       useSelectionOnly: !!(targetContext.selectionText && targetContext.selectionText.trim().length > 0)
     };
-    this.previewResult = '';
     this.isBusy = false;
     this.abortController = null;
   }
@@ -3669,28 +3711,25 @@ class SermonMdRefineModal extends Modal {
       btn.onclick = () => {
         this.opts.docProfile = p.id;
         syncProfileUi();
-        if (this.mode === 'rules') runBtn.click();
       };
       profileBtns.push(btn);
     }
     hintBtn.onclick = () => {
       this.opts.docProfile = 'general';
       syncProfileUi();
-      if (this.mode === 'rules') runBtn.click();
     };
     syncProfileUi();
 
-    // Mode cards
+    // Mode cards (규칙 · AI 맞춤법, 구조화 정리 통합 + 전체 편집)
     const modeGroup = contentEl.createDiv({ cls: 'smr-mode-group' });
     const modes = [
-      { id: 'rules', title: '⚡ 규칙 정리', tooltip: '원문 글자 100% 보존 · 줄바꿈/계층/성구 즉시 정리' },
-      { id: 'ai_proof', title: '🤖 AI 맞춤법, 구조화 정리', tooltip: 'AI 오타·띄어쓰기 교정 + 제목1~6·목록 구조화' },
-      { id: 'ai_struct', title: '✨ 전체 편집', tooltip: '규칙 정리 + AI 맞춤법, 구조화 정리 + 전체 계층 2차 검수 일괄 실행' }
+      { id: 'ai_proof', title: '🤖 규칙 · AI 맞춤법, 구조화 정리', tooltip: '규칙 정리(줄바꿈·계층·성구) + AI 맞춤법·구조화 정리 통합 실행 (AI 키 미설정 시 규칙 정리 자동 실행)' },
+      { id: 'ai_struct', title: '✨ 전체 편집', tooltip: '규칙 정리 + AI 전체 통독·계층 설계 + 전체 문서 2차 규칙 검수 일괄 실행' }
     ];
     const modeButtons = [];
     const syncModeVisibility = () => {
-      customRow.style.display = this.mode === 'rules' ? 'none' : 'block';
-      optBox.style.display = this.mode === 'ai_proof' ? 'none' : 'grid';
+      customRow.style.display = 'block';
+      optBox.style.display = 'grid';
       scopeWrap.style.display = 'flex';
       numWrap.style.display = 'flex';
     };
@@ -3707,7 +3746,7 @@ class SermonMdRefineModal extends Modal {
       modeButtons.push(btn);
     }
 
-    // Rule options box
+    // Rule options box (visible across both modes)
     const optBox = contentEl.createDiv({ cls: 'smr-options-box' });
     const addOpt = (key, labelText) => {
       const lbl = optBox.createEl('label', { cls: 'smr-opt-label' });
@@ -3715,7 +3754,6 @@ class SermonMdRefineModal extends Modal {
       cb.checked = !!this.opts[key];
       cb.onchange = () => {
         this.opts[key] = cb.checked;
-        if (this.mode === 'rules') runBtn.click();
       };
       lbl.createSpan({ text: labelText });
     };
@@ -3726,7 +3764,7 @@ class SermonMdRefineModal extends Modal {
     addOpt('stripVerseBlockquotes', '성구 줄 앞 > 인용구 제거');
     addOpt('addMissingFrontmatter', '상단 강사/장소 → YAML 머리말');
     if (this.ctx.selectionText) addOpt('useSelectionOnly', '드래그로 선택한 영역만 다듬기');
-    optBox.style.display = this.mode === 'ai_proof' ? 'none' : 'grid';
+    optBox.style.display = 'grid';
 
     const scopeWrap = contentEl.createDiv({ cls: 'smr-opt-select-row' });
     scopeWrap.createSpan({ text: '제목 적용 깊이:' });
@@ -3741,7 +3779,6 @@ class SermonMdRefineModal extends Modal {
     });
     scopeSel.onchange = () => {
       this.opts.headingLevelScope = scopeSel.value;
-      if (this.mode === 'rules') runBtn.click();
     };
     scopeWrap.style.display = 'flex';
 
@@ -3758,7 +3795,6 @@ class SermonMdRefineModal extends Modal {
     });
     numSel.onchange = () => {
       this.opts.autoNumberedStyle = numSel.value;
-      if (this.mode === 'rules') runBtn.click();
     };
     numWrap.style.display = 'flex';
 
@@ -3770,108 +3806,58 @@ class SermonMdRefineModal extends Modal {
       placeholder: 'AI 추가 지시 (선택, 예: 서론/본론 1,2,3으로 나눠줘 / 한문 병기 유지)'
     });
     customInput.value = this.plugin.settings.customPromptNote || '';
-    customRow.style.display = this.mode === 'rules' ? 'none' : 'block';
-
-    // Run preview row
-    const actionRow = contentEl.createDiv({ cls: 'smr-action-row' });
-    const runBtn = actionRow.createEl('button', { cls: 'smr-btn-primary', text: '▶ 미리보기 생성' });
-    const stopBtn = actionRow.createEl('button', { text: '중단' });
-    stopBtn.style.display = 'none';
-    const statusLine = contentEl.createDiv({ cls: 'smr-status-line', text: '미리보기 생성 버튼을 누르면 적용 전 결과를 먼저 확인할 수 있습니다.' });
-
-    // Side-by-side preview
-    const previewGrid = contentEl.createDiv({ cls: 'smr-preview-grid' });
-    const leftCol = previewGrid.createDiv({ cls: 'smr-preview-col' });
-    leftCol.createDiv({ cls: 'smr-preview-head', text: '원본' });
-    const origArea = leftCol.createEl('textarea', { cls: 'smr-preview-area' });
-    origArea.readOnly = true;
-
-    const rightCol = previewGrid.createDiv({ cls: 'smr-preview-col' });
-    rightCol.createDiv({ cls: 'smr-preview-head', text: '정리된 결과 (직접 수정 가능)' });
-    const outArea = rightCol.createEl('textarea', { cls: 'smr-preview-area' });
+    customRow.style.display = 'block';
 
     const getSourceText = () => (this.opts.useSelectionOnly && this.ctx.selectionText ? this.ctx.selectionText : this.ctx.fullText);
-    origArea.value = getSourceText();
 
-    // Footer apply buttons
+    // Status + Footer execute/apply buttons (no preview needed)
+    const statusLine = contentEl.createDiv({ cls: 'smr-status-line', text: '원하는 옵션과 모드를 선택한 뒤 아래 적용 버튼을 누르면 즉시 노트를 정리합니다.' });
     const footer = contentEl.createDiv({ cls: 'smr-footer-row' });
+    const stopBtn = footer.createEl('button', { text: '중단' });
+    stopBtn.style.display = 'none';
     const saveNewBtn = footer.createEl('button', { text: '📄 새 노트로 저장 (_정리본)' });
     const applyBtn = footer.createEl('button', { cls: 'smr-btn-primary', text: '✅ 현재 노트에 적용 (Ctrl+Z 되돌리기 가능)' });
-    saveNewBtn.disabled = true;
-    applyBtn.disabled = true;
 
     const setBusy = (busy) => {
       this.isBusy = busy;
-      runBtn.disabled = busy;
       stopBtn.style.display = busy ? 'inline-block' : 'none';
-      saveNewBtn.disabled = busy || !outArea.value;
-      applyBtn.disabled = busy || !outArea.value;
+      saveNewBtn.disabled = busy;
+      applyBtn.disabled = busy;
     };
 
     stopBtn.onclick = () => {
       if (this.abortController) this.abortController.abort();
     };
 
-    runBtn.onclick = async () => {
+    const runDirectRefine = async () => {
       const src = getSourceText();
-      origArea.value = src;
       this.plugin.settings.customPromptNote = customInput.value.trim();
       await this.plugin.saveSettings();
 
-      if (this.mode === 'rules') {
-        const refined = refineMarkdownByRules(src, this.opts);
-        outArea.value = refined;
-        this.previewResult = refined;
-        const srcLines = src.split('\n').length;
-        const outLines = refined.split('\n').length;
-        statusLine.setText(`⚡ 규칙 정리 완료 (${src.length.toLocaleString()}자 / ${srcLines}줄 → ${refined.length.toLocaleString()}자 / ${outLines}줄)`);
-        setBusy(false);
-        return;
+      const keys = this.plugin.collectGeminiKeys();
+      if (!keys.length) {
+        statusLine.setText('⚡ Gemini API 키가 없어 규칙 정리(줄바꿈·계층·성구)를 실행합니다...');
+        return refineMarkdownByRules(src, this.opts);
       }
 
       this.abortController = new AbortController();
-      setBusy(true);
-      try {
-        const refined = await this.plugin.refineWithGemini(
-          src,
-          this.mode,
-          customInput.value.trim(),
-          (msg) => statusLine.setText(msg),
-          this.abortController.signal,
-          this.opts.headingLevelScope,
-          this.opts.autoNumberedStyle,
-          this.opts
-        );
-        outArea.value = refined;
-        this.previewResult = refined;
-        statusLine.setText(`✅ AI 정리 완료 (${src.length.toLocaleString()}자 → ${refined.length.toLocaleString()}자). 아래 결과를 확인 후 적용하세요.`);
-      } catch (err) {
-        if (err && err.name === 'AbortError') {
-          statusLine.setText('⏹ 사용자에 의해 중단되었습니다.');
-        } else {
-          statusLine.setText(`❌ 오류: ${err.message || err}`);
-          new Notice(`노트 정리 실패: ${err.message || err}`, 6000);
-        }
-      } finally {
-        setBusy(false);
-      }
-    };
-
-    // Run rule preview immediately when opened in rules mode
-    if (this.mode === 'rules') {
-      runBtn.click();
-    }
-
-    outArea.oninput = () => {
-      const hasVal = !!outArea.value;
-      applyBtn.disabled = this.isBusy || !hasVal;
-      saveNewBtn.disabled = this.isBusy || !hasVal;
+      return this.plugin.refineWithGemini(
+        src,
+        this.mode,
+        customInput.value.trim(),
+        (msg) => statusLine.setText(msg),
+        this.abortController.signal,
+        this.opts.headingLevelScope,
+        this.opts.autoNumberedStyle,
+        this.opts
+      );
     };
 
     applyBtn.onclick = async () => {
-      const finalText = outArea.value;
-      if (!finalText) return;
+      setBusy(true);
       try {
+        const finalText = await runDirectRefine();
+        if (!finalText) return;
         if (this.plugin.settings.keepBackupOnOverwrite && !this.opts.useSelectionOnly) {
           await this.plugin.createBackupCopy(this.ctx.file, this.ctx.fullText);
         }
@@ -3889,14 +3875,22 @@ class SermonMdRefineModal extends Modal {
         new Notice('✅ 노트가 정리되었습니다. (Ctrl+Z로 되돌리기 가능)');
         this.close();
       } catch (err) {
-        new Notice(`적용 실패: ${err.message || err}`, 6000);
+        if (err && err.name === 'AbortError') {
+          statusLine.setText('⏹ 사용자에 의해 중단되었습니다.');
+        } else {
+          statusLine.setText(`❌ 오류: ${err.message || err}`);
+          new Notice(`적용 실패: ${err.message || err}`, 6000);
+        }
+      } finally {
+        setBusy(false);
       }
     };
 
     saveNewBtn.onclick = async () => {
-      const finalText = outArea.value;
-      if (!finalText) return;
+      setBusy(true);
       try {
+        const finalText = await runDirectRefine();
+        if (!finalText) return;
         const parent = this.ctx.file.parent && this.ctx.file.parent.path !== '/' ? `${this.ctx.file.parent.path}/` : '';
         let newPath = `${parent}${this.ctx.file.basename}_정리본.md`;
         let n = 2;
@@ -3908,7 +3902,14 @@ class SermonMdRefineModal extends Modal {
         new Notice(`📄 새 노트로 저장되었습니다: ${created.basename}`);
         this.close();
       } catch (err) {
-        new Notice(`새 노트 저장 실패: ${err.message || err}`, 6000);
+        if (err && err.name === 'AbortError') {
+          statusLine.setText('⏹ 사용자에 의해 중단되었습니다.');
+        } else {
+          statusLine.setText(`❌ 오류: ${err.message || err}`);
+          new Notice(`새 노트 저장 실패: ${err.message || err}`, 6000);
+        }
+      } finally {
+        setBusy(false);
       }
     };
   }
@@ -3935,10 +3936,9 @@ class SermonMdRefinerSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('기본 정리 모드')
       .addDropdown((d) => d
-        .addOption('rules', '⚡ 규칙 정리 (원문 100% 보존)')
-        .addOption('ai_proof', '🤖 AI 맞춤법, 구조화 정리')
-        .addOption('ai_struct', '✨ 전체 편집 (규칙 정리 + AI 맞춤법·구조화)')
-        .setValue(s.defaultMode || 'rules')
+        .addOption('ai_proof', '🤖 규칙 · AI 맞춤법, 구조화 정리 (권장)')
+        .addOption('ai_struct', '✨ 전체 편집 (규칙 + AI + 2차 심층 검수)')
+        .setValue(s.defaultMode === 'ai_struct' ? 'ai_struct' : 'ai_proof')
         .onChange(async (v) => { s.defaultMode = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
@@ -4027,7 +4027,7 @@ class SermonMdRefinerPlugin extends Plugin {
 
     this.addCommand({
       id: 'open-sermon-md-refiner',
-      name: '현재 노트 서식 다듬기 창 열기 (미리보기 · 규칙/AI)',
+      name: '현재 노트 서식 다듬기 창 열기 (규칙 · AI 정리)',
       editorCallback: (editor, view) => {
         this.openRefineModal(editor, view);
       }
@@ -4086,6 +4086,9 @@ class SermonMdRefinerPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!this.settings.defaultMode || this.settings.defaultMode === 'rules') {
+      this.settings.defaultMode = 'ai_proof';
+    }
     this.settings.quoteStandaloneVerses = false;
   }
 
@@ -4265,7 +4268,7 @@ class SermonMdRefinerPlugin extends Plugin {
         throw ae;
       }
       if (onProgress) {
-        const stage = mode === 'ai_struct' ? '✨ [전체 편집]' : '🤖 [AI 맞춤법·구조화]';
+        const stage = mode === 'ai_struct' ? '✨ [전체 편집]' : '🤖 [규칙 · AI 맞춤법·구조화]';
         onProgress(`${stage} 본문 다듬기 및 하이어라키 적용 중 (${i + 1} / ${chunks.length} 구간)...`);
       }
       const prevTail = i > 0 && outChunks[i - 1]
@@ -4286,46 +4289,17 @@ class SermonMdRefinerPlugin extends Plugin {
         assembled = stripAiAddedVerseBlockquotes(assembled, origQuotedKeys);
       }
       if (onProgress) {
-        onProgress('🔍 전체 문서 규칙 마무리·성구·일관성 2차 검수 중...');
+        onProgress('🔍 전체 문서 규칙 마무리·제목 계층·성구 1회 완성 검수 중...');
       }
-      if (mode === 'ai_struct') {
-        // Apply rule options (line-merge, tabs, auto-number clean, Bible refs, strip '>', reconcile) WITHOUT overriding AI's H1~H6 semantic design
-        const postBody = refineMarkdownByRules(assembled, Object.assign({}, effectiveRuleOpts, {
-          addMissingFrontmatter: false,
-          preserveExistingHeadings: true,
-          respectAiHeadings: hasCustomNote,
-          useSelectionOnly: true
-        }));
-        assembled = postBody.trim();
-      } else {
-        let postLines = convertHtmlParagraphAndBreakTags(
-          normalizeHwpDashBullets(unescapePandocMarkdown(assembled))
-        ).split('\n');
-        if (effectiveRuleOpts.mergeBrokenLines !== false) {
-          postLines = mergeBrokenLinesPass(postLines, effectiveRuleOpts.vaultBasePath || '');
-        }
-        postLines = convertPandocUnderlineTags(postLines.join('\n')).split('\n');
-        if (effectiveRuleOpts.normalizeBibleRefs !== false) {
-          postLines = splitAndNormalizeBiblePassagesPass(postLines, effectiveRuleOpts);
-        }
-        postLines = postLines.map((l) => (
-          effectiveRuleOpts.normalizeBibleRefs !== false
-            ? normalizeBibleRefsInLine(l, !!effectiveRuleOpts.quoteStandaloneVerses, effectiveStripQuotes)
-            : l
-        ));
-        postLines = reconcileDocumentStructure(postLines, {
-          docProfile: effectiveDocProfile,
-          normalizeHierarchy: effectiveRuleOpts.normalizeHierarchy !== false,
-          respectAiHeadings: hasCustomNote,
-          spacesToTabs: effectiveRuleOpts.spacesToTabs !== false,
-          headingLevelScope: effectiveScope,
-          autoNumberedStyle: effectiveNumStyle
-        });
-        if (effectiveDocProfile === 'general' && effectiveRuleOpts.normalizeBibleRefs !== false) {
-          postLines = padGeneralStandaloneBibleVerses(postLines);
-        }
-        assembled = postLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-      }
+      // Run full convergent rule pipeline on BOTH merged (ai_proof) and ai_struct so Click 1 immediately promotes headings & normalizes outlines
+      const postBody = refineMarkdownByRules(assembled, Object.assign({}, effectiveRuleOpts, {
+        addMissingFrontmatter: false,
+        fromAiPass: true,
+        preserveExistingHeadings: hasCustomNote,
+        respectAiHeadings: hasCustomNote,
+        useSelectionOnly: true
+      }));
+      assembled = postBody.trim();
     }
 
     const joined = assembled;
