@@ -57,6 +57,7 @@ const DEFAULT_SETTINGS = {
   normalizeBibleRefs: true,
   quoteStandaloneVerses: false,
   stripVerseBlockquotes: true,
+  fixKoreanSpacing: true,
   addMissingFrontmatter: false,
   keepBackupOnOverwrite: false,
   customPromptNote: ''
@@ -805,8 +806,8 @@ function classifyOutlineLine(line) {
     };
   }
 
-  // HWP bullet symbols: • ◦ ▪ □ ○ ▶ ◈
-  const hwpBullet = trimmed.match(/^([•◦▪□○▶◈])\s*(.+)$/);
+  // HWP bullet symbols: • ◦ ▪ □ ○ ▶ ◈ (never peel repeated placeholders like ○○○)
+  const hwpBullet = trimmed.match(/^([•◦▪□○▶◈])\s*(?![•◦▪□○▶◈])(.+)$/);
   if (hwpBullet) {
     return { kind: 'outline_sub', rank: 2, canBeHeading: false, indent, marker: '', body: hwpBullet[2], text: trimmed };
   }
@@ -1379,6 +1380,8 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
   const n = nextLine.trim();
   if (!p || !n) return false;
   if (/^(?:#{1,6}\s|```|~~~|\|.*\||---+$|\*\*\*+$|<!--)/.test(p)) return false;
+  if (/^\*\*[^*\n]+\*\*$/.test(p) || /^\*\*[^*\n]+\*\*$/.test(n)) return false;
+  if (/https?:\/\/\S+$/.test(p)) return false;
   if (/^(?:\*\*\d{1,2}[.)]\s+[^*\n]+\*\*|\d{1,2}[.)]\s+\*\*[^*\n]+\*\*)[.?!]?$/.test(p)) return false;
   if (isProtectedLine(nextLine)) return false;
   if (/^(?:\*\*)?\d{1,2}[.)]\s+/.test(n)) return false;
@@ -1398,7 +1401,7 @@ function shouldMergeProse(prevLine, nextLine, gapCount = 0) {
   // Inside an active ">..." range verse quote (or unclosed bracket), allow continuing even if next starts with (12) or - (10)
   if (!activeVerseQuote && !unclosedSpan) {
     if (isListLine(nextLine)) return false;
-    if (!nextIsInlineUnderline && /^(?:\(|\[|✓|✔|※|예\)|▶|●|■|◆|▲|★|◎|◩|•|◦|▪|\d+[.)]|[①-⑳]|[가-하]\.|[a-zA-Z]\.)/.test(n)) return false;
+    if (!nextIsInlineUnderline && /^(?:\*\*\s*)?(?:\(|\[|✓|✔|※|예\)|▶|●|■|◆|▲|★|◎|◩|•|◦|▪|\d+[.)]|[①-⑳]|[가-하]\.|[a-zA-Z]\.)/.test(n)) return false;
     if (nextIsInlineUnderline && /^\[\s*(?:마|막|눅|요|행|롬|고전|고후|갈|엡|빌|골|살전|살후|딤전|딤후|딛|몬|히|약|벧전|벧후|요일|이|삼|유|계|창|출|레|민|신)\s*\d+/.test(n)) return false;
     if (new RegExp(`^(?:${BOOK_PATTERN})\\s*\\(?\\d{1,3}\\s*[:：]`).test(n)) return false;
   } else {
@@ -2765,8 +2768,9 @@ function reconcileDocumentStructure(lines, opts) {
     for (let i = 0; i < out.length; i++) {
       if (/^\s*(?:```|~~~)/.test(out[i])) { inFence5 = !inFence5; continue; }
       if (inFence5) continue;
-      if (/^[ \t]*[✓✔]\s+/.test(out[i])) {
-        out[i] = out[i].replace(/^[ \t]*[✓✔]\s+/, '');
+      if (/^[ \t]*(?:-\s+)?[✓✔]\s+/.test(out[i])) {
+        out[i] = out[i].replace(/^[ \t]*(?:-\s+)?[✓✔]\s+/, '');
+        continue;
       }
       const mCol0 = out[i].match(/^-\s+(.+)$/);
       if (mCol0) {
@@ -2811,9 +2815,11 @@ function demoteLoneDocTitleIfMajorH2(lines, isGeneralDoc = false) {
     if (m[1].length === 1) h1s.push({ idx: i, text: m[2].trim() });
     else if (m[1].length === 2) h2s.push({ idx: i, text: m[2].trim() });
   }
-  if (h1s.length === 1 && h2s.length >= 2 && h1s[0].idx < h2s[0].idx) {
+  if (h1s.length === 1 && h2s.length >= 2 && h1s[0].idx < h2s[0].idx && h1s[0].idx <= 3) {
+    const hasProseBeforeH1 = out.slice(0, h1s[0].idx).some((l) => l.trim() !== '');
+    if (hasProseBeforeH1) return out;
     const title = h1s[0].text;
-    const isPlainDocTitle = !/^(?:[■●◆▲▶★◎◩]|\d{1,3}[.)]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(title);
+    const isPlainDocTitle = !/^(?:[■●◆▲▶★◎◩※]|\d{1,3}[.)]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(title);
     const hasMajorH2Symbols = h2s.some((h) => /^(?:[■●◆▲▶★◎◩]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\.)/.test(h.text));
     if (isPlainDocTitle && (hasMajorH2Symbols || isGeneralDoc)) {
       const clean = title.replace(/^\*\*(.+)\*\*$/, '$1');
@@ -2868,6 +2874,72 @@ function extractLeadingMetadataFrontmatter(rawLines) {
   yamlLines.push('tags: []');
   yamlLines.push('---');
   return { generatedFm: yamlLines.join('\n') + '\n', startIdx: consumed };
+}
+
+/**
+ * AI 없이 동작하는 오프라인 한국어 띄어쓰기 보정 (인라인 코드/링크/URL/HTML 태그 보호, 멱등성 보장)
+ */
+function fixKoreanSpacingOffline(line) {
+  if (!line || !/[가-힣]{4,}/.test(line)) return line;
+  const saved = [];
+  let work = String(line).replace(/(`[^`]+`|!\[\[[^\]]+\]\]|\[\[[^\]]+\]\]|https?:\/\/[^\s)]+|<[^>]+>)/g, (m) => {
+    saved.push(m);
+    return `\uE000${saved.length - 1}\uE001`;
+  });
+
+  const applySpacingPass = (s) => {
+    // 1. 설교·신학 빈출 붙여쓰기 구문
+    const exactPairs = [
+      [/하나님의은혜/g, '하나님의 은혜'],
+      [/하나님의말씀/g, '하나님의 말씀'],
+      [/하나님의사랑/g, '하나님의 사랑'],
+      [/하나님의나라/g, '하나님의 나라'],
+      [/하나님의영광/g, '하나님의 영광'],
+      [/하나님의백성/g, '하나님의 백성'],
+      [/하나님의자녀/g, '하나님의 자녀'],
+      [/하나님의능력/g, '하나님의 능력'],
+      [/하나님의뜻/g, '하나님의 뜻'],
+      [/예수그리스도/g, '예수 그리스도'],
+      [/성령하나님/g, '성령 하나님'],
+      [/성경말씀/g, '성경 말씀'],
+      [/뿐만아니라/g, '뿐만 아니라'],
+      [/그뿐만아니라/g, '그뿐만 아니라'],
+      [/그렇기때문에/g, '그렇기 때문에'],
+      [/그럼에도불구하고/g, '그럼에도 불구하고'],
+    ];
+    for (const [re, rep] of exactPairs) s = s.replace(re, rep);
+
+    // 2. 긴 한글 어절(5자 이상) 내부의 명확한 조사·어미·의존명사·보조용언 경계 분리
+    s = s.replace(/[가-힣]{5,}/g, (tok) => {
+      let t = tok;
+      // 2a. 자주 붙는 전치/접속 구문 ('에대해', '을통해', '을위해', '로인해', '에서', '에게' 등)
+      t = t.replace(/([가-힣]{1,})(에대해|에대한|에대하여|에관해|에관한|에따라|에따른|에의해|에의한|을통해|를통해|을통하여|를통하여|을위해|를위해|을위하여|를위하여|로인해|로인하여|으로인해|으로인하여)(?=[가-힣])/g, (_, a, b) => {
+        return `${a}${b[0]} ${b.slice(1)} `;
+      });
+      // 2b. '~할 수 있/없', '~될 수 있/없' 등 의존명사 '수' + '있/없'
+      t = t.replace(/([가-힣]*[할될볼알갈올줄받을살만남찾얻믿])수(있|없)(?=[가-힣])/g, '$1 수 $2');
+      // 2c. 관형형 + '것이다/것입니다/것을/것이/것은/것도/것으로/것처럼/때문'
+      t = t.replace(/(한|할|된|될|인|있는|없는|하는|되는|받는|주는|믿는|보는|가는|오는|좋은|크신|많은|적은|새로운|귀한|참된|영원한|분명한|정확한)(것(?:이다|입니다|이었다|이었으며|이며|이고|으로|을|이|은|도|처럼)|때문(?:에|이다|입니다))(?=[가-힣]*)/g, '$1 $2');
+      // 2d. 보조용언 '~고 있~', '~야 한/할/함'
+      t = t.replace(/([가-힣]{2,})(하고|되고|가고|오고|보고|알고|믿고|살고|듣고|받고|쓰고|읽고)(있[다는데어었습니])/g, '$1$2 $3');
+      t = t.replace(/([가-힣]{2,})(해야|되어야|돼야|가야|와야|봐야|알아야|믿어야|살아야)(한|할|함|했)/g, '$1$2 $3');
+      // 2e. 관형사/자주 쓰는 관형형 + 2자 이상 명사 (대한민국/대한예수교 제외)
+      t = t.replace(/([가-힣]{1,}에)(대한|관한|따른|위한|통한)(?!민국|예수교)([가-힣]{2,})/g, '$1 $2 $3');
+      t = t.replace(/^(대한|관한|따른|위한|통한)(?!민국|예수교)([가-힣]{3,})/g, '$1 $2');
+      t = t.replace(/(정확한|분명한|새로운|참된|귀한|영원한|거룩한|완전한|충분한|필요한|중요한|올바른|진실한|모든)([가-힣]{2,})/g, '$1 $2');
+      // 2f. 2자 이상 명사 + 조사(의/을/를/에서/에게/으로/로) + 명확한 후속 단어
+      t = t.replace(/([가-힣]{2,})(의)(하나님|예수|그리스도|성령|말씀|은혜|사랑|뜻|나라|영광|능력|이름|백성|자녀|교회|믿음|소망|구원|십자가|복음|진리|생명|마음|삶|모든|참된|새로운|거룩한)/g, '$1$2 $3');
+      t = t.replace(/([가-힣]{2,})(을|를)(통해|통하여|위해|위하여|따라|향해|향하여|가지고|갖고|믿고|알고|보고|듣고|받고|주고|하고|되고|지키고|사랑하고|이해하고|깨닫고|기억하고|전하고|선포하고|찬양하고|경배하고|기도하고|구하는|찾는|얻는|누리는|이루는|드리는|섬기는)(?=[가-힣]*)/g, '$1$2 $3');
+      t = t.replace(/([가-힣]{2,})(으로|로)(구원|말미암|인해|인하여|나아|향하|변화|회복|살아|들어가|나아가)/g, '$1$2 $3');
+      t = t.replace(/([가-힣]{2,})(에서|에게서|에게는|에서도|으로는|으로서|으로써)(?=[가-힣]{2,})/g, '$1$2 ');
+      return t.replace(/ {2,}/g, ' ').trim();
+    });
+    return s;
+  };
+
+  work = applySpacingPass(work);
+  work = work.replace(/ {2,}/g, ' ');
+  return work.replace(/\uE000(\d+)\uE001/g, (_, idx) => saved[Number(idx)] || '');
 }
 
 function refineMarkdownByRules(rawText, options = {}) {
@@ -3419,6 +3491,17 @@ function refineMarkdownByRules(rawText, options = {}) {
 
   // Fifth pass: whole-document consistency reconciliation (inspect entire outline & fix parent/sibling inversions)
   let finalLines = reconcileDocumentStructure(verseCleanLines, opts);
+  if (opts.fixKoreanSpacing !== false) {
+    let inFence = false;
+    finalLines = finalLines.map((line) => {
+      if (/^\s*(?:```|~~~)/.test(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence) return line;
+      return fixKoreanSpacingOffline(line);
+    });
+  }
   if (isGeneralDoc && opts.normalizeBibleRefs !== false) {
     finalLines = padGeneralStandaloneBibleVerses(finalLines);
   }
@@ -3432,11 +3515,12 @@ function refineMarkdownByRules(rawText, options = {}) {
     const cleanHead = head.endsWith('\n') ? head : head + '\n';
     outText = cleanHead + outText;
   }
-  // Guarantee 1-click idempotency: converge if post-Pass-1 splits/unwraps exposed new headings or blank-line boundaries
-  if (!opts._isConvergencePass && !opts.respectAiHeadings && outText !== String(rawText || '')) {
+  // Guarantee 1-click idempotency: converge cleanly across passes (up to 5) whenever Pass-N unwraps/promotes new structure
+  const convDepth = opts._convDepth || 0;
+  if (!opts.respectAiHeadings && convDepth < 5 && outText !== String(rawText || '')) {
     return refineMarkdownByRules(outText, Object.assign({}, opts, {
       addMissingFrontmatter: false,
-      _isConvergencePass: true
+      _convDepth: convDepth + 1
     }));
   }
   return outText;
@@ -3682,6 +3766,7 @@ class SermonMdRefineModal extends Modal {
       normalizeBibleRefs: !!plugin.settings.normalizeBibleRefs,
       quoteStandaloneVerses: !!plugin.settings.quoteStandaloneVerses,
       stripVerseBlockquotes: !!plugin.settings.stripVerseBlockquotes,
+      fixKoreanSpacing: plugin.settings.fixKoreanSpacing !== false,
       addMissingFrontmatter: !!plugin.settings.addMissingFrontmatter,
       useGeminiAi: !!plugin.settings.useGeminiAi,
       useSelectionOnly: !!(targetContext.selectionText && targetContext.selectionText.trim().length > 0)
@@ -3756,6 +3841,7 @@ class SermonMdRefineModal extends Modal {
     addOpt('spacesToTabs', '목록 들여쓰기 탭(\\t) 통일 (마인드맵)');
     addOpt('normalizeBibleRefs', '성경 구절 표기 정규화 (창 1:1)');
     addOpt('stripVerseBlockquotes', '성구 줄 앞 > 인용구 제거');
+    addOpt('fixKoreanSpacing', '한국어 띄어쓰기 자동 보정 (AI 없이)');
     addOpt('addMissingFrontmatter', '상단 강사/장소 → YAML 머리말');
     if (this.ctx.selectionText) addOpt('useSelectionOnly', '드래그로 선택한 영역만 다듬기');
     addOpt('useGeminiAi', '🤖 Gemini AI 맞춤법·구조화 함께 실행 (선택)', syncAiNoteRow);
