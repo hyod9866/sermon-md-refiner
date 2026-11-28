@@ -2966,6 +2966,7 @@ function fixKoreanSpacingOffline(line) {
       // 제42항: 관형형(ㄴ/ㄹ/는/던/란/라는) + 의존명사 ('수', '것', '상태', '때', '중', ...)
       t = t.replace(/([가-힣]+)수(있|없)(?=[가-힣])/g, (m, stem, v) => getHangulJongseong(stem[stem.length - 1]) === 8 ? `${stem} 수 ${v}` : m);
       t = t.replace(boundNounRe, (m, stem, dep) => {
+        if (stem === '그런' && /^데/.test(dep)) return m;
         const jong = getHangulJongseong(stem[stem.length - 1]);
         if (jong === 4 || jong === 8 || /[가-힣]+(?:는|던|란|라는)$/.test(stem)) {
           return `${stem} ${dep}`;
@@ -2994,11 +2995,18 @@ function fixKoreanSpacingOffline(line) {
       t = t.replace(/([가-힣]{2,})(있다|없다|아니다|한다|했다|하였다|된다|되었다|됐다|하신다|하시다|입니다|합니다|했습니다|됩니다|되었습니다)(?=[가-힣]{2,})/g, '$1$2 ');
 
       // 제45·48항: 접속사/부사/호칭/관형어 + 명사/용언
-      t = t.replace(leadWordRe, '$1 ');
+      t = t.replace(leadWordRe, (m, w, offset, full) => {
+        const rest = full.slice(offset + w.length);
+        if (w === '그런데' && /^(?:도|는|요|만|서)/.test(rest)) return m;
+        return `${w} `;
+      });
       t = t.replace(adverbRe, '$1 $2');
       t = t.replace(/([가-힣]{1,}에)(대한|관한|따른|위한|통한)(?!민국|예수교)([가-힣]{2,})/g, '$1 $2 $3');
       t = t.replace(/^(대한|관한|따른|위한|통한)(?!민국|예수교)([가-힣]{3,})/g, '$1 $2');
-      t = t.replace(modifierRe, '$1 $2');
+      t = t.replace(modifierRe, (m, mod, rest) => {
+        if (mod === '그런' && /^데(?:도|는|요|만|서)?$/.test(rest)) return m;
+        return `${mod} ${rest}`;
+      });
       t = t.replace(/([가-힣]{2,})(목사|전도사|장로|집사|권사|선교사|사역자)(가|는|은|이|를|을|에게|께|와|과)(?=[가-힣]{2,})/g, '$1 $2$3 ');
 
       // 제41항: 관형격 조사 '~의' 뒤 띄어쓰기 (회의실/주의사항/정의감 등 한자어 복합명사 제외)
