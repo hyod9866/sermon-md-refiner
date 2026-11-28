@@ -2956,6 +2956,8 @@ function fixKoreanSpacingOffline(line) {
     s = s.replace(/(\d+(?:년|개월|일|명|권|차))(정도|가량|여|쯤|이상|이하|미만|전후)(?=[가-힣]*)/g, '$1 $2 ');
 
     for (const [re, rep] of KO_SPACING_TABLES.exactPairs) s = s.replace(re, rep);
+    // 이미 잘못 띄어진 '~한 다면/~한 다고/~한 다는/~한 다며' 복원
+    s = s.replace(/([가-힣]*[한된]) (다면|다고|다는|다며)(?=[가-힣\s.,!?]|$)/g, '$1$2');
 
     s = s.replace(/[가-힣]{4,}/g, (tok) => {
       let t = tok;
@@ -3034,7 +3036,7 @@ function fixKoreanSpacingOffline(line) {
       t = t.replace(/([가-힣]{1,}(?:한|된))(?=[가-힣]{2,})/g, (m, stem, offset, full) => {
         if (/^(?:요한|대한|제한|무한|북한|남한|한국|한글|한계|한번|한자|한강|한숨|한평생|한마음|한사람)$/.test(stem)) return m;
         const rest = full.slice(offset + stem.length);
-        if (/^(?:국|민|글|복음|계시록|일서|이서|삼서|적)$/.test(rest)) return m;
+        if (/^(?:국|민|글|복음|계시록|일서|이서|삼서|적|다면|다고|다는|다며|다|든|지|가|데|니|고|며|면|서|게|기|군|구|야|요|록)/.test(rest)) return m;
         if (stem.length === 1) return m;
         return `${stem} `;
       });
