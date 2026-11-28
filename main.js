@@ -2957,7 +2957,7 @@ function fixKoreanSpacingOffline(line) {
 
     for (const [re, rep] of KO_SPACING_TABLES.exactPairs) s = s.replace(re, rep);
 
-    s = s.replace(/[가-힣]{5,}/g, (tok) => {
+    s = s.replace(/[가-힣]{4,}/g, (tok) => {
       let t = tok;
       // 제41항: 복합·전치 조사 구문
       t = t.replace(/([가-힣]{1,})(에대해|에대한|에대하여|에관해|에관한|에따라|에따른|에의해|에의한|을통해|를통해|을통하여|를통하여|을위해|를위해|을위하여|를위하여|로인해|로인하여|으로인해|으로인하여)(?=[가-힣]*)/g, (_, a, b) => `${a}${b[0]} ${b.slice(1)} `);
@@ -2995,8 +2995,9 @@ function fixKoreanSpacingOffline(line) {
       t = t.replace(/([가-힣]{2,})(목사|전도사|장로|집사|권사|선교사|사역자)(가|는|은|이|를|을|에게|께|와|과)(?=[가-힣]{2,})/g, '$1 $2$3 ');
 
       // 제41항: 관형격 조사 '~의' 뒤 띄어쓰기 (회의실/주의사항/정의감 등 한자어 복합명사 제외)
-      t = t.replace(/([가-힣]{2,})의(?=[가-힣]{2,})/g, (m, stem, offset, full) => {
+      t = t.replace(/([가-힣]{2,})의(?=[가-힣]{1,})/g, (m, stem, offset, full) => {
         const rest = full.slice(offset + stem.length + 1);
+        if (rest.length === 1 && !/^(?:뜻|길|빛|집|삶|때|일|꿈|힘|말|눈|손|입|몸|빵|물|불|문|땅|별|해|달|복|죄|화|피|살)$/.test(rest)) return m;
         if (/(?:회|동|주|정|결|예|고|본|진|국|민|협|심|건|발|대)$/.test(stem) && /^(?:실|장|서|록|중|하|감|력|사항|롭|바른|적|여부|미|원)/.test(rest)) {
           return m;
         }
@@ -3004,6 +3005,14 @@ function fixKoreanSpacingOffline(line) {
           return m;
         }
         return `${stem}의 `;
+      });
+      // 제41·48항: 관형형/보조사 '~는' 뒤 띄어쓰기 (동사 어미 '~는데/~는지/~는가/~는다/~는군' 제외)
+      t = t.replace(/([가-힣]{1,})는(?=[가-힣]{2,})/g, (m, stem, offset, full) => {
+        const rest = full.slice(offset + stem.length + 1);
+        if (/^(?:데요|데도|데|지만|지도|지라도|지|가요|가보다|가|다는|다고|다면|다|군|구|니|냐|걸)/.test(rest)) return m;
+        if (/^(?:하|되|가|오|보|듣|받|주|쓰|읽|믿|사|알|있|없|크|작|많|적|좋|같)$/.test(stem)) return `${stem}는 `;
+        if (stem.length >= 2) return `${stem}는 `;
+        return m;
       });
       // 제41·48항: ㄴ받침 형용사/관형형('~한/~된/~로운/~다운/~스러운/~하신/~받은/~있는/~없는' 및 고유어 관형형) 뒤 띄어쓰기
       t = t.replace(/([가-힣]{2,}(?:로운|다운|스러운|하신|받은|있는|없는))(?=[가-힣]{2,})/g, '$1 ');
